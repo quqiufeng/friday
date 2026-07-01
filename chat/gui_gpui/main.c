@@ -37,7 +37,7 @@ int main() {
     fprintf(stderr, "calling run...\n");
     fflush(stderr);
     int ret = run(g_app);
-    fprintf(stderr, "run returned %d\n", ret);
+    fprintf(stderr, "gui_run returned %d\n", ret);
 
     if (app_free) app_free(g_app);
     dlclose(h);
