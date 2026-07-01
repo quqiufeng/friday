@@ -197,13 +197,22 @@ pub extern "C" fn gui_app_create(_cfg: *const c_char) -> *mut c_void {
         idx: Arc::new(Mutex::new(0)),
     };
 
+    eprintln!("[create] 启动摄像头线程...");
     { let f = app.frame.clone(); let w = app.w.clone(); let h = app.h.clone();
-      thread::spawn(move || camera_loop(f, w, h)); }
+      thread::spawn(move || {
+          eprintln!("[camera] 线程启动");
+          camera_loop(f, w, h);
+      }); }
+    eprintln!("[create] 启动推理线程...");
 
     { let f = app.frame.clone(); let w = app.w.clone(); let h = app.h.clone();
       let ai = app.ai_text.clone(); let st = app.status.clone(); let run = app.running.clone();
       let idx = app.idx.clone();
-      thread::spawn(move || ai_loop(f, w, h, ai, st, run, idx)); }
+      thread::spawn(move || {
+          eprintln!("[ai] 线程启动");
+          ai_loop(f, w, h, ai, st, run, idx);
+      }); }
+    eprintln!("[create] 线程已启动，返回 app");
 
     Box::into_raw(Box::new(app)) as *mut c_void
 }
@@ -228,7 +237,7 @@ pub extern "C" fn gui_run(app: *mut c_void) -> c_int {
     eprintln!("[gui_run] 创建 SDL 窗口");
     let sdl = match sdl2::init() { Ok(s) => s, Err(e) => { eprintln!("sdl: {}", e); return -1; } };
     let video = match sdl.video() { Ok(v) => v, Err(e) => { eprintln!("video: {}", e); return -1; } };
-    let win = match video.window("Friday 监控", 640, 480).position_centered().resizable().build() {
+    let win = match video.window("Friday 监控", 1280, 960).position_centered().resizable().build() {
         Ok(w) => w, Err(e) => { eprintln!("window: {}", e); return -1; }
     };
     let mut canvas = match win.into_canvas().build() {
@@ -255,23 +264,24 @@ pub extern "C" fn gui_run(app: *mut c_void) -> c_int {
             }
         }
 
-        if let Some(data) = app.frame.lock().unwrap().take() {
-            let w = *app.w.lock().unwrap();
-            let h = *app.h.lock().unwrap();
-            if w > 0 && h > 0 && data.len() >= (w * h * 3) as usize {
-                let need_new = tex.as_ref().map_or(true, |t| {
-                    let q = t.query(); q.width != w || q.height != h
-                });
-                if need_new {
-                    tex = tc.create_texture_streaming(sdl2::pixels::PixelFormatEnum::BGR24, w, h).ok();
+                if let Some(data) = app.frame.lock().unwrap().take() {
+                    let w = *app.w.lock().unwrap();
+                    let h = *app.h.lock().unwrap();
+                    if w > 0 && h > 0 && data.len() >= (w * h * 3) as usize {
+                        let need_new = tex.as_ref().map_or(true, |t| {
+                            let q = t.query(); q.width != w || q.height != h
+                        });
+                        if need_new {
+                            tex = tc.create_texture_streaming(sdl2::pixels::PixelFormatEnum::BGR24, w, h).ok();
+                        }
+                        if let Some(ref mut t) = tex {
+                            t.update(None, &data, (w * 3) as usize).ok();
+                            canvas.clear();
+                            let dst = sdl2::rect::Rect::new(0, 0, 1280, 960);
+                            let _ = canvas.copy(t, None, Some(dst));
+                        }
+                    }
                 }
-                if let Some(ref mut t) = tex {
-                    t.update(None, &data, (w * 3) as usize).ok();
-                    canvas.clear();
-                    let _ = canvas.copy(t, None, None);
-                }
-            }
-        }
         canvas.present();
         thread::sleep(Duration::from_millis(33));
     }
