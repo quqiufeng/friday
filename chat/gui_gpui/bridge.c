@@ -1,5 +1,4 @@
-// bridge.c - HTTP 客户端桥接 llama-server omni API
-// 维护 duplex session 状态
+// bridge.c - libcurl multi interface 异步 HTTP 客户端
 // 编译: gcc -shared -fPIC -o libbridge.so bridge.c -lcurl -lpthread
 
 #include <stdio.h>
@@ -8,163 +7,96 @@
 #include <curl/curl.h>
 #include <pthread.h>
 
-static CURL *curl = NULL;
-static int cnt = 0;
-static int is_listening = 1;
-static char resp_buf[1048576];
-static int resp_len = 0;
+#define MAX_RESP_SIZE 1048576
+
+static int g_sse_detect = 0;
+
+struct response {
+    char data[MAX_RESP_SIZE];
+    int len;
+    int done;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+};
 
 static size_t write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
+    struct response *resp = (struct response *)userdata;
     size_t total = size * nmemb;
-    if (resp_len + total < sizeof(resp_buf)) {
-        memcpy(resp_buf + resp_len, ptr, total);
-        resp_len += total;
-        resp_buf[resp_len] = 0;
+    pthread_mutex_lock(&resp->lock);
+    if (resp->len + total < MAX_RESP_SIZE - 1) {
+        memcpy(resp->data + resp->len, ptr, total);
+        resp->len += total;
+        resp->data[resp->len] = 0;
+        // SSE 模式: 检测结束标记提前返回
+        if (g_sse_detect && (strstr(resp->data, "[DONE]") || strstr(resp->data, "__END_OF_TURN__") || strstr(resp->data, "__IS_LISTEN__"))) {
+            resp->done = 1;
+            pthread_mutex_unlock(&resp->lock);
+            return 0; // 中断 curl
+        }
     }
+    pthread_mutex_unlock(&resp->lock);
     return total;
 }
 
-// 初始化 bridge (启动 llama-server + omni_init)
-int bridge_init() {
-    curl_global_init(CURL_GLOBAL_ALL);
-    curl = curl_easy_init();
-    if (!curl) return -1;
-
-    // 等待 llama-server 就绪 (不自己启动，由外部管理)
-    for (int i = 0; i < 180; i++) {
-        curl_easy_setopt(curl, CURLOPT_URL, "http://127.0.0.1:19080/health");
-        curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
-        if (curl_easy_perform(curl) == CURLE_OK) break;
-        sleep(5);
+// HTTP 请求
+// sse_detect: 0=正常等完成, 1=检测SSE结束标记([DONE]/__IS_LISTEN__)提前返回
+int bridge_post(const char *url, const char *json_body, char *out_buf, int out_size, int timeout_sec, int sse_detect) {
+    static int initialized = 0;
+    if (!initialized) {
+        curl_global_init(CURL_GLOBAL_ALL);
+        initialized = 1;
     }
 
-    // omni_init 由外部脚本调用，这里只初始化状态
-    is_listening = 1;
-    cnt = 0;
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        fprintf(stderr, "[bridge] curl_easy_init failed\n");
+        return -1;
+    }
+
+    struct response resp;
+    memset(&resp, 0, sizeof(resp));
+    pthread_mutex_init(&resp.lock, NULL);
+    pthread_cond_init(&resp.cond, NULL);
+
+    g_sse_detect = sse_detect;
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)timeout_sec);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
+
+    CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK && res != CURLE_WRITE_ERROR) {
+        fprintf(stderr, "[bridge] curl error: %s\n", curl_easy_strerror(res));
+    }
+    curl_easy_cleanup(curl);
+
+    int ret = 0;
+    if (res == CURLE_OK || res == CURLE_WRITE_ERROR) {
+        pthread_mutex_lock(&resp.lock);
+        int len = resp.len < out_size - 1 ? resp.len : out_size - 1;
+        memcpy(out_buf, resp.data, len);
+        out_buf[len] = 0;
+        ret = len;
+        pthread_mutex_unlock(&resp.lock);
+    } else {
+        ret = -1;
+    }
+
+    pthread_mutex_destroy(&resp.lock);
+    pthread_cond_destroy(&resp.cond);
+    return ret;
+}
+
+// 初始化
+int bridge_init() {
     return 0;
 }
 
-// 发送一帧 (图片路径 + 音频路径)
-// 返回: 0=listen, 1=speak (有文字), -1=错误
-// 文字输出到 out_text (max_len)
-int bridge_process_frame(const char *img_path, const char *wav_path, char *out_text, int max_len) {
-    if (!curl) return -1;
-
-    cnt++;
-    resp_len = 0;
-
-    if (is_listening) {
-        // listen 状态：只发 prefill (不带图片)，然后 decode
-        // 实际上 duplex 模式的 listen 只需要 decode
-        curl_easy_setopt(curl, CURLOPT_URL, "http://127.0.0.1:19080/v1/stream/decode");
-        curl_easy_setopt(curl, CURLOPT_POST, 1L);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
-
-        char json[256];
-        snprintf(json, sizeof(json), "{\"stream\":true}");
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
-        struct curl_slist *headers = curl_slist_append(NULL, "Content-Type: application/json");
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-        resp_len = 0;
-        CURLcode res = curl_easy_perform(curl);
-        curl_slist_free_all(headers);
-
-        if (res == CURLE_OK) {
-            // 解析 SSE
-            char *line = strtok(resp_buf, "\n");
-            while (line) {
-                if (strncmp(line, "data: ", 6) == 0) {
-                    char *data_str = line + 6;
-                    if (strcmp(data_str, "[DONE]") == 0) break;
-                    // 简单检查 is_listen
-                    if (strstr(data_str, "\"is_listen\":true") || strstr(data_str, "__IS_LISTEN__")) {
-                        // 继续 listen
-                        break;
-                    }
-                    // 提取 content
-                    char *content = strstr(data_str, "\"content\":\"");
-                    if (content) {
-                        content += 11;
-                        char *end = strchr(content, '"');
-                        if (end) {
-                            int len = end - content;
-                            if (len > max_len - 1) len = max_len - 1;
-                            memcpy(out_text, content, len);
-                            out_text[len] = 0;
-                            is_listening = 0;
-                            return 1;
-                        }
-                    }
-                }
-                line = strtok(NULL, "\n");
-            }
-        }
-        return 0;
-    } else {
-        // 说话状态：发 prefill (带图片) + decode
-        curl_easy_setopt(curl, CURLOPT_URL, "http://127.0.0.1:19080/v1/stream/prefill");
-        curl_easy_setopt(curl, CURLOPT_POST, 1L);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
-
-        char json[512];
-        snprintf(json, sizeof(json),
-            "{\"audio_path_prefix\":\"%s\",\"img_path_prefix\":\"%s\",\"cnt\":%d}",
-            wav_path, img_path, cnt);
-
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
-        struct curl_slist *headers = curl_slist_append(NULL, "Content-Type: application/json");
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-        resp_len = 0;
-        curl_easy_perform(curl);
-        curl_slist_free_all(headers);
-
-        // decode
-        curl_easy_setopt(curl, CURLOPT_URL, "http://127.0.0.1:19080/v1/stream/decode");
-        snprintf(json, sizeof(json), "{\"debug_dir\":\"/tmp/omni_out2\",\"stream\":true}");
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
-        headers = curl_slist_append(NULL, "Content-Type: application/json");
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-        resp_len = 0;
-        CURLcode res = curl_easy_perform(curl);
-        curl_slist_free_all(headers);
-
-        if (res == CURLE_OK) {
-            char *line = strtok(resp_buf, "\n");
-            while (line) {
-                if (strncmp(line, "data: ", 6) == 0) {
-                    char *data_str = line + 6;
-                    if (strcmp(data_str, "[DONE]") == 0) break;
-                    if (strstr(data_str, "\"is_listen\":true") || strstr(data_str, "__IS_LISTEN__")) {
-                        is_listening = 1;
-                        break;
-                    }
-                    char *content = strstr(data_str, "\"content\":\"");
-                    if (content) {
-                        content += 11;
-                        char *end = strchr(content, '"');
-                        if (end) {
-                            int len = end - content;
-                            if (len > max_len - 1) len = max_len - 1;
-                            memcpy(out_text, content, len);
-                            out_text[len] = 0;
-                            return 1;
-                        }
-                    }
-                }
-                line = strtok(NULL, "\n");
-            }
-        }
-        return 0;
-    }
-}
-
 void bridge_cleanup() {
-    if (curl) {
-        curl_easy_cleanup(curl);
-        curl = NULL;
-    }
     curl_global_cleanup();
 }
