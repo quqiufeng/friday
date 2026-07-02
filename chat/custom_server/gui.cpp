@@ -248,10 +248,10 @@ static void ai_worker() {
     if (g_ctx) { /* omni_free crash bug, skip */ }
 }
 
-// ─── SDL 文字渲染辅助 ───────────────────────────────────────────
-static void render_text(SDL_Renderer *ren, TTF_Font *font, const std::string &text,
-                        int x, int y, SDL_Color color, int max_width) {
-    if (text.empty() || !font) return;
+// ─── SDL 文字渲染辅助 (返回下一行 Y) ────────────────────────────
+static int render_text(SDL_Renderer *ren, TTF_Font *font, const std::string &text,
+                       int x, int y, SDL_Color color, int max_width) {
+    if (text.empty() || !font) return y;
 
     // 自动换行
     std::string line;
@@ -299,6 +299,7 @@ static void render_text(SDL_Renderer *ren, TTF_Font *font, const std::string &te
             line.clear();
         }
     }
+    return yy;
 }
 
 // ─── 主界面 ─────────────────────────────────────────────────────
@@ -345,7 +346,7 @@ int main(int, char **) {
     if (!font) font = TTF_OpenFont("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc", 22);
     if (!font) font = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22);
 
-    TTF_Font *font_small = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16);
+    TTF_Font *font_small = TTF_OpenFont("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", 16);
 
     std::thread ai(ai_worker);
 
@@ -375,46 +376,42 @@ int main(int, char **) {
             }
         }
 
-        // 右侧信息面板背景
+        // 底部信息栏
+        int BH = 110;
         SDL_SetRenderDrawColor(ren, 0, 0, 0, 180);
-        SDL_Rect panel = {W - 320, 0, 320, H};
+        SDL_Rect panel = {0, H - BH, W, BH};
         SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
         SDL_RenderFillRect(ren, &panel);
 
-        // 状态显示
         if (font) {
             SDL_Color white = {255, 255, 255, 255};
             SDL_Color green = {100, 255, 100, 255};
             SDL_Color yellow = {255, 220, 80, 255};
 
-            // 标题
-            render_text(ren, font, "Friday AI", W - 310, 10, green, 300);
-
-            // 状态
+            SDL_Color status_color = green;
+            std::string status_text;
             {
                 std::lock_guard<std::mutex> lk(g_mtx);
-                SDL_Color status_color = green;
-                if (g_status.find("失败") != std::string::npos) status_color = {255, 80, 80, 255};
-                else if (g_status.find("加载") != std::string::npos || g_status.find("推理") != std::string::npos)
+                status_text = g_status;
+                if (status_text.find("失败") != std::string::npos) status_color = {255, 80, 80, 255};
+                else if (status_text.find("加载") != std::string::npos || status_text.find("推理") != std::string::npos)
                     status_color = yellow;
-                render_text(ren, font_small, "状态: " + g_status, W - 310, 45, status_color, 300);
+            }
+            render_text(ren, font_small, "Friday AI · " + status_text, 10, H - BH + 8, status_color, W - 120);
 
-                // AI 回复
-                render_text(ren, font_small, "── AI 回复 ──", W - 310, 75, white, 300);
+            SDL_Color gray = {120, 120, 120, 255};
+            render_text(ren, font_small, "ESC 退出", W - 100, H - BH + 8, gray, 100);
 
-                int y = 100;
-                auto texts = g_ai_texts;
-                for (auto it = texts.rbegin(); it != texts.rend() && y < H - 40; ++it) {
-                    render_text(ren, font_small, *it, W - 310, y, white, 300);
-                    y += 45;
+            {
+                std::lock_guard<std::mutex> lk(g_mtx);
+                if (!g_ai_texts.empty()) {
+                    auto texts = g_ai_texts;
+                    int y = H - BH + 35;
+                    for (auto it = texts.rbegin(); it != texts.rend() && y < H - 8; ++it) {
+                        y = render_text(ren, font_small, *it, 10, y, white, W - 20) + 4;
+                    }
                 }
             }
-        }
-
-        // 底部提示
-        if (font_small) {
-            SDL_Color gray = {180, 180, 180, 255};
-            render_text(ren, font_small, "ESC 退出 | 说'你好星期五'唤醒", 10, H - 25, gray, W);
         }
 
         SDL_RenderPresent(ren);
