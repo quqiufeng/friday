@@ -126,7 +126,101 @@ OPENCV_LOG_LEVEL=DISABLED \
 | 窗口不显示 | SDL2 需要正确的 DISPLAY | `DISPLAY=:0` |
 | GPU 显存不足 | 残留进程占用 | `pkill -9 gui` 后重试 |
 
-## 9. 演进历史
+## 9. 参考: Web 版本 (Python Demo) 双工数据流
+
+官方 Demo (`MiniCPM-o-Demo/`) 基于 WebSocket 的双工推理流程，作为 C++ 实现的参考架构。
+
+### 9.1 数据捕获 (浏览器前端)
+
+| 输入 | API | 格式 | 频率 |
+|------|-----|------|------|
+| 麦克风 | AudioWorklet + `getUserMedia` | Float32 PCM, 16kHz, mono | 16000 samples/chunk (1s) |
+| 摄像头 | `canvas.toDataURL('image/jpeg', 0.7)` |  JPEG base64, quality 0.7 | 1 frame/chunk (1s) |
+
+### 9.2 WebSocket 消息
+
+```
+客户端 → 服务端 (每 1 秒):
+{
+  "type": "audio_chunk",
+  "audio_base64": "<Float32Array PCM 16kHz raw base64>",
+  "frame_base64_list": ["<JPEG base64>"]
+}
+
+服务端 → 客户端:
+{
+  "type": "result",
+  "is_listen": true/false,
+  "text": "AI 生成的文字",
+  "audio_data": "<24kHz PCM base64>",
+  "end_of_turn": true/false
+}
+```
+
+### 9.3 服务端处理 (worker.py)
+
+```
+WebSocket → audio_chunk
+         │
+         ├─ audio_base64 → numpy float32 array
+         ├─ frame_base64_list → PIL Image
+         │
+         ▼
+    duplex_prefill(audio_waveform, frame_list)
+         │
+         ▼
+    duplex_generate()
+         │
+         ├─ is_listen: model 决定听/说
+         ├─ text: 生成文字
+         └─ audio_data: CosyVoice TTS PCM
+
+    ↓ 返回 WebSocket result
+```
+
+### 9.4 C++ 后端适配器 (cpp_backend.py)
+
+Python 的 C++ 后端适配器将内存数据转为临时文件后调用 `llama-server` HTTP API：
+
+```python
+def duplex_prefill(self, audio_waveform, frame_list):
+    # 音频: numpy → WAV 文件
+    temp_audio = f"/tmp/duplex_{cnt}.wav"
+    sf.write(temp_audio, audio_waveform, 16000)
+
+    # 图像: PIL → PNG 文件
+    temp_image = f"/tmp/duplex_{cnt}.png"
+    frame_list[0].save(temp_image)
+
+    # HTTP 调用 llama-server
+    requests.post("/v1/stream/prefill", json={
+        "audio_path_prefix": temp_audio,
+        "img_path_prefix": temp_image,
+        "cnt": cnt
+    })
+
+def duplex_generate(self):
+    resp = requests.post("/v1/stream/decode", json={
+        "stream": True,
+        "length_penalty": 1.1
+    })
+    # 解析 SSE: is_listen, text, end_of_turn
+```
+
+### 9.5 与 C++ 架构对比
+
+| 环节 | Web (Python + C++ 后端) | C++ 单二进制 (gui.cpp) |
+|------|------------------------|----------------------|
+| 音频捕获 | JS AudioWorklet → base64 → numpy → WAV 文件 | ALSA `snd_pcm_readi` → PCM → WAV 文件 |
+| 画面捕获 | canvas → base64 JPEG → PNG 文件 | OpenCV `cv::imwrite` → JPEG 文件 |
+| 推理调用 | HTTP POST `/v1/stream/prefill` + SSE decode | 直接 `stream_prefill()` + `stream_decode()` |
+| 回复读取 | SSE 流式解析 | `text_cv.wait_for` 条件变量 |
+| TTS 播放 | base64 PCM → AudioContext | `ffmpeg concat` + `aplay` |
+| 零子进程 | ❌ Python 本身 + requests 库 | ✅ 单进程, 无外部依赖 |
+
+C++ 单二进制架构在推理效率上更优（直接 API 调用无 HTTP 开销），但功能等价于 Web 版本的 C++ 后端路径。
+
+## 10. 演进历史
 
 | 阶段 | 方案 | 结果 |
 |------|------|------|
