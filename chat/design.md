@@ -2,6 +2,50 @@
 
 > 钢铁侠的 Friday，开源实现。
 > 基于 [MiniCPM-o 4.5](https://github.com/OpenBMB/MiniCPM-o) + [llama.cpp-omni](https://github.com/tc-mb/llama.cpp-omni) 构建。
+> 官方在线 Demo: https://minicpmo45.modelbest.cn/omni（浏览器全双工，C++ 版架构参考）
+> 官方文档: https://minicpmo45.modelbest.cn/docs/zh/
+
+## 快速启动 (C++ 后端 + Web)
+
+```bash
+# 1. 编译 llama-omni-server
+cd /opt/llama.cpp-omni/build
+cmake .. -DLLAMA_BUILD_SERVER=ON -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="80;89"
+cmake --build . --target llama-omni-server -j$(nproc)
+
+# 2. 启动 llama-omni-server（后端推理）
+/opt/llama.cpp-omni/build/bin/llama-omni-server \
+  -m /data/models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \
+  -ngl 99 --host 127.0.0.1 --port 22500
+
+# 3. 启动 Worker（转发请求到 llama-omni-server）
+cd /opt/friday/chat/web
+/data/venv/bin/python worker.py \
+  --host 0.0.0.0 --port 22400 --gpu-id 0 \
+  --backend-server-url http://127.0.0.1:22500
+
+# 4. 启动 Gateway（WebSocket 入口）
+/data/venv/bin/python gateway.py \
+  --host 0.0.0.0 --port 8006 \
+  --workers localhost:22400
+  # --https --ssl-certfile certs/cert.pem --ssl-keyfile certs/key.pem
+
+# 浏览器打开 https://localhost:8006
+```
+
+或一键启动脚本（自动启动后端 + Worker + Gateway，Ctrl+C 停止）：
+
+```bash
+bash /opt/friday/chat/custom_server/start.sh
+```
+
+日志目录: `/opt/friday/chat/custom_server/logs/`
+
+| 进程 | 端口 | 日志文件 |
+|------|------|----------|
+| llama-omni-server | 127.0.0.1:22500 | `logs/llama-server.log` |
+| Worker | 0.0.0.0:22400 | `logs/worker.log` |
+| Gateway | 0.0.0.0:8006 | `logs/gateway.log` |
 
 ## 1. 架构总览
 
@@ -57,7 +101,7 @@
 1. `omni_init` — 加载 LLM + Vision + Audio + TTS 模型
 2. 设置 system prompt（控制 AI 行为）
 3. 声纹参考音频加载
-4. 摄像头初始化（OpenCV VideoCapture, 640x480）
+4. 摄像头初始化（OpenCV VideoCapture, 640x480, CAP_V4L2）
 5. 启动摄像头采集线程（~30fps）
 
 ### 4.2 推理循环 (流式)
@@ -89,6 +133,41 @@ export OPENCV_LOG_LEVEL=DISABLED       # 禁用 gphoto2 插件警告
 export LD_LIBRARY_PATH=/opt/llama.cpp-omni/build/bin  # libomni.so 路径
 ```
 
+## 4.5 摄像头设备
+
+| 设备 | 类型 | 使用方法 |
+|------|------|----------|
+| **USB 摄像头** (带麦克风) | `/dev/video0` | 默认模式，`cap.open(0, CAP_V4L2)` |
+| **TP-Link RTSP 摄像头** | `rtsp://admin:密码@IP:554/stream1` | 设置环境变量 `CAMERA_RTSP_URL` |
+
+USB 摄像头内置麦克风作为音频输入源（`plughw:2,0`），与 RTSP 模式共用同一麦克风。
+
+### 切换方式
+
+```bash
+# USB 摄像头（默认，不带 CAMERA_RTSP_URL）
+/opt/friday/chat/custom_server/gui
+
+# RTSP 摄像头
+CAMERA_RTSP_URL='rtsp://admin:wuyou272097579@192.168.1.77:554/stream1' \
+/opt/friday/chat/custom_server/gui
+```
+
+## 4.6 音频设备一览
+
+| 用途 | 设备 | 描述 |
+|------|------|------|
+| **麦克风输入 (capture)** | `plughw:2,0` | USB 摄像头内置麦克风 (card 2) |
+| **TTS 播放 (playback)** | `plughw:3,0` | USB 音频设备 Rouyin-tianyuan-43198 (card 3) |
+| HDMI 音频 | `plughw:0,3` | NVIDIA HDMI (备用播放设备) |
+| 板载声卡 | `plughw:1,0` | Realtek ALC892 (Auto-Mute 已禁用) |
+
+```bash
+# 查看当前音频设备
+aplay -l
+arecord -l
+```
+
 ## 5. 编译
 
 ```bash
@@ -98,75 +177,46 @@ make -j$(nproc)
 cp gui /opt/friday/chat/custom_server/gui
 ```
 
-## 5.1 音频设备
+## 5.1 音频设备配置
 
-TTS 通过 ALSA `aplay` 播放，默认设备在源码 `TTS_DEVICE` 中配置。
-
-### 查看可用音频输出设备
-```bash
-aplay -l
-```
-
-输出示例：
-```
-card 0: NVidia [HDA NVidia], device 3: HDMI 0
-card 1: Generic [HD-Audio Generic], device 0: ALC892 Analog
-card 3: Rouyintianyuan4 [Rouyin-tianyuan-43198], device 0: USB Audio
-```
-
-### 测试音频输出
-```bash
-# 测试指定设备（将 N 替换为 card 编号）
-aplay -D plughw:N,0 /path/to/test.wav
-```
-
-### 配置 TTS 设备
-编辑 `gui.cpp` 中的 `TTS_DEVICE`，或直接修改源码中的设备名：
+TTS 设备在源码 `TTS_DEVICE` 中配置：
 ```cpp
 static const char *TTS_DEVICE = "plughw:3,0";  // USB 音频设备
 ```
 
-### 启用 USB 音频设备
+### 调试命令
 
 ```bash
-# 启用输出并调到最大音量
-amixer -c 3 sset 'PCM Playback Switch' on
-amixer -c 3 sset 'PCM Playback Volume' 63
-
-# 测试播放
+# 测试 TTS 播放
 ffmpeg -y -f lavfi -i "sine=frequency=880:duration=0.2" -af "volume=3" \
   -ac 1 -ar 48000 /tmp/_test.wav 2>/dev/null
 aplay -D plughw:3,0 /tmp/_test.wav
 
-# 滴滴两声
-aplay -D plughw:3,0 /tmp/_test.wav; sleep 0.25; aplay -D plughw:3,0 /tmp/_test.wav
+# 查看当前音频设备
+aplay -l
+arecord -l
 ```
 
-### 声卡 Auto-Mute
-Realtek ALC892 等声卡的 `Auto-Mute Mode` 默认启用，会导致后面板无声：
-```bash
-amixer -c 1 sset 'Auto-Mute Mode' Disabled
-```
-程序启动时会自动禁用。
+参考设备一览表见 [§4.6 音频设备一览](#46-音频设备一览)。
 
 ## 6. 运行
 
-### USB 摄像头
+### 基本环境变量
 ```bash
-LD_LIBRARY_PATH=/opt/llama.cpp-omni/build/bin \
-DISPLAY=:0 \
-LIBGL_ALWAYS_SOFTWARE=1 \
-OPENCV_LOG_LEVEL=DISABLED \
+export LD_LIBRARY_PATH=/opt/llama.cpp-omni/build/bin
+export DISPLAY=:0
+export LIBGL_ALWAYS_SOFTWARE=1
+export OPENCV_LOG_LEVEL=DISABLED
+```
+
+### USB 摄像头（默认）
+```bash
 /opt/friday/chat/custom_server/gui
 ```
 
 ### RTSP 网络摄像头 (TP-Link / 海康等)
 ```bash
-CAMERA_RTSP_URL='rtsp://admin:密码@192.168.1.77:554/stream1' \
-LD_LIBRARY_PATH=/opt/llama.cpp-omni/build/bin \
-DISPLAY=:0 \
-LIBGL_ALWAYS_SOFTWARE=1 \
-OPENCV_LOG_LEVEL=DISABLED \
+CAMERA_RTSP_URL='rtsp://admin:wuyou272097579@192.168.1.77:554/stream1' \
 /opt/friday/chat/custom_server/gui
 ```
 
@@ -177,6 +227,8 @@ RTSP 地址格式（TP-Link）：
 | 子码流 | `rtsp://admin:密码@IP:554/stream2` |
 
 摄像头 RTSP 密码为设备本地管理员密码，非云端账号密码。
+
+USB 摄像头与 RTSP 摄像头通过 `CAMERA_RTSP_URL` 环境变量有无切换，详见 [§4.5 摄像头设备](#45-摄像头设备)。
 
 ## 7. 硬件要求
 
@@ -196,139 +248,342 @@ RTSP 地址格式（TP-Link）：
 | 窗口不显示 | SDL2 需要正确的 DISPLAY | `DISPLAY=:0` |
 | GPU 显存不足 | 残留进程占用 | `pkill -9 gui` 后重试 |
 
-## 9. Web 版本 (Python Demo) 部署
+## 9. 架构参考: Duplex 双工机制 (开发指导)
 
-### 9.0 Python 环境
+官方文档: https://minicpmo45.modelbest.cn/docs/zh/architecture/duplex/
 
-```bash
-# 虚拟环境路径: /data/venv
-/data/venv/bin/python gateway.py
-/data/venv/bin/python worker.py --gpu 0 --port 22440
-```
+### 9.1 核心概念
 
-### 9.1 一键启动
+Duplex 模式实现了类似电话的实时对话体验：用户说话的同时，模型可随时开口回应。
 
-```bash
-cd /opt/friday/chat/MiniCPM-o-Demo
-bash start_all.sh
-```
+| 特性 | Chat 模式 | Half-Duplex 模式 | Duplex 模式 |
+|------|-----------|-----------------|-------------|
+| 交互方式 | 轮次式（手动触发） | 轮次式（VAD 自动触发） | 实时全双工（同时收听和回应） |
+| 输入处理 | 一次性 prefill | VAD 检测 → prefill | 每秒流式 prefill 音频/视频 |
+| Worker 占用 | 仅推理期间 | 整个会话独占 | 整个会话独占 |
 
-### 9.2 手动启动
+### 9.2 每秒一次的 Unit 循环
 
-```bash
-# 终端 1: 启动 Gateway
-/data/venv/bin/python gateway.py
-
-# 终端 2: 启动 Worker（每张 GPU 一个）
-/data/venv/bin/python worker.py --gpu 0 --port 22440
-```
-
-### 9.3 配置文件
-
-`config.json` 中的关键字段：
-
-| 字段 | 值 | 说明 |
-|------|-----|------|
-| `backend` | `"cpp"` | 推理后端 (cpp=GGUF, pytorch=HuggingFace) |
-| `model_dir` | `/data/models/MiniCPM-o-4_5-gguf` | GGUF 模型目录 |
-| `llm_model` | `MiniCPM-o-4_5-Q4_K_M.gguf` | 主模型文件 |
-| `cpp_server_port` | `19080` | llama-server 端口 |
-
-### 9.4 参考: 双工数据流
-
-官方 Demo (`MiniCPM-o-Demo/`) 基于 WebSocket 的双工推理流程，作为 C++ 实现的参考架构。
-
-### 9.1 数据捕获 (浏览器前端)
-
-| 输入 | API | 格式 | 频率 |
-|------|-----|------|------|
-| 麦克风 | AudioWorklet + `getUserMedia` | Float32 PCM, 16kHz, mono | 16000 samples/chunk (1s) |
-| 摄像头 | `canvas.toDataURL('image/jpeg', 0.7)` |  JPEG base64, quality 0.7 | 1 frame/chunk (1s) |
-
-### 9.2 WebSocket 消息
+Duplex 核心是一个**每秒执行一次**的 prefill-generate 循环，每次循环称为一个 "unit"：
 
 ```
-客户端 → 服务端 (每 1 秒):
-{
-  "type": "audio_chunk",
-  "audio_base64": "<Float32Array PCM 16kHz raw base64>",
-  "frame_base64_list": ["<JPEG base64>"]
-}
-
-服务端 → 客户端:
-{
-  "type": "result",
-  "is_listen": true/false,
-  "text": "AI 生成的文字",
-  "audio_data": "<24kHz PCM base64>",
-  "end_of_turn": true/false
-}
+loop 每秒一个 Unit:
+  客户端 → 服务端: audio_chunk (~1s) + video_frame
+  服务端: streaming_prefill()
+    1. feed ⟨unit⟩ token（标记新 unit 开始）
+    2. 编码图像 → feed 视觉 embedding
+    3. 编码音频 → feed 音频 embedding
+    4. 产生 pending_logits
+  服务端: streaming_generate()
+    基于 pending_logits 解码
+    输出 ⟨listen⟩ → 继续聆听
+    输出文本 token → 说话
+  alt 模型决定说话:
+    服务端 → 客户端: text + audio_data
+  else 模型决定聆听:
+    服务端 → 客户端: is_listen=true
 ```
 
-### 9.3 服务端处理 (worker.py)
-
-```
-WebSocket → audio_chunk
-         │
-         ├─ audio_base64 → numpy float32 array
-         ├─ frame_base64_list → PIL Image
-         │
-         ▼
-    duplex_prefill(audio_waveform, frame_list)
-         │
-         ▼
-    duplex_generate()
-         │
-         ├─ is_listen: model 决定听/说
-         ├─ text: 生成文字
-         └─ audio_data: CosyVoice TTS PCM
-
-    ↓ 返回 WebSocket result
-```
-
-### 9.4 C++ 后端适配器 (cpp_backend.py)
-
-Python 的 C++ 后端适配器将内存数据转为临时文件后调用 `llama-server` HTTP API：
-
+关键代码逻辑:
 ```python
-def duplex_prefill(self, audio_waveform, frame_list):
-    # 音频: numpy → WAV 文件
-    temp_audio = f"/tmp/duplex_{cnt}.wav"
-    sf.write(temp_audio, audio_waveform, 16000)
+# streaming_prefill(): 每秒调用一次
+self.decoder.feed(self.decoder.embed_token(self.unit_token_id))
+vision_hidden_states = self.model.get_vision_embedding(processed_frames)
+self.decoder.feed(vision_embed)
+audio_embeds = self.model.get_audio_embedding(processed_audio)
+self.decoder.feed(audio_embed)
+# → 产生 pending_logits
 
-    # 图像: PIL → PNG 文件
-    temp_image = f"/tmp/duplex_{cnt}.png"
-    frame_list[0].save(temp_image)
-
-    # HTTP 调用 llama-server
-    requests.post("/v1/stream/prefill", json={
-        "audio_path_prefix": temp_audio,
-        "img_path_prefix": temp_image,
-        "cnt": cnt
-    })
-
-def duplex_generate(self):
-    resp = requests.post("/v1/stream/decode", json={
-        "stream": True,
-        "length_penalty": 1.1
-    })
-    # 解析 SSE: is_listen, text, end_of_turn
+# streaming_generate(): 基于 pending_logits 解码
+logits = self.pending_logits
+for j in range(max_new_speak_tokens_per_chunk):
+    last_id = self.decoder.decode(logits=logits, mode=decode_mode, ...)
+    if last_id == listen_token_id:
+        break  # 模型选择聆听
+    elif last_id in chunk_terminator_token_ids:
+        break  # chunk 结束
+    else:
+        self.res_ids.append(last_id.item())  # 说话 token
+        logits, hidden = self.decoder.feed(...)  # 继续解码
 ```
 
-### 9.5 与 C++ 架构对比
+### 9.3 完整流程（含 Gateway 代理）
 
-| 环节 | Web (Python + C++ 后端) | C++ 单二进制 (gui.cpp) |
-|------|------------------------|----------------------|
-| 音频捕获 | JS AudioWorklet → base64 → numpy → WAV 文件 | ALSA `snd_pcm_readi` → PCM → WAV 文件 |
-| 画面捕获 | canvas → base64 JPEG → PNG 文件 | OpenCV `cv::imwrite` → JPEG 文件 |
-| 推理调用 | HTTP POST `/v1/stream/prefill` + SSE decode | 直接 `stream_prefill()` + `stream_decode()` |
-| 回复读取 | SSE 流式解析 | `text_cv.wait_for` 条件变量 |
+```
+客户端 → Gateway: WS /ws/duplex/{session_id}
+Gateway → Queue: enqueue("omni_duplex")
+Queue → Worker: 分配 Worker（独占）
+客户端 → Gateway: prepare (系统提示词 + 配置)
+Gateway → Worker: duplex_prepare()
+loop 全双工循环（每秒一次）:
+  客户端 → Gateway: audio_chunk (+ video_frame)
+  Gateway → Worker: duplex_prefill(audio, frames)
+  Worker → Worker: duplex_generate()
+  alt 模型决定说话:
+    Worker → Gateway → 客户端: result (text + audio_data)
+  else:
+    Worker → Gateway → 客户端: result (is_listen=true)
+客户端 → Gateway: stop
+Gateway → Worker: duplex_cleanup()
+Gateway → Queue: release_worker()
+```
+
+### 9.4 Omnimodal vs Audio 模式
+
+| 模式 | 方式 | 输入 |
+|------|------|------|
+| **Omnimodal Full-Duplex** | `mode=video` | audio_chunk + video_frame（每秒） |
+| **Audio Full-Duplex** | `mode=audio` | 仅 audio_chunk（每秒） |
+
+两者共享相同的 prefill-generate unit 循环，区别仅在于是否传入视频帧。
+
+## 10. Realtime API 协议
+
+官方文档: https://minicpmo45.modelbest.cn/docs/zh/realtime-api/
+
+### 10.1 视频双工 (`/v1/realtime?mode=video`)
+
+视频全双工: 客户端持续发送 16kHz 音频 + JPEG 帧; 服务端返回 listen/text/audio。
+
+**连接**
+
+```
+wss://host/v1/realtime?mode=video
+```
+
+| 项目 | 值 |
+|------|-----|
+| 帧格式 | JSON 文本帧 |
+| 上行音频 | 16kHz, 单声道, float32 PCM, base64 |
+| 上行视频 | JPEG base64 (`input.video_frames`) |
+| 下行音频 | 24kHz, 单声道, float32 PCM, base64 |
+| 会话上限 | 300 秒 |
+
+**初始化**
+
+```
+→ session.init
+{
+  "type": "session.init",
+  "payload": {
+    "system_prompt": "你是一个有用的视频语音助手",
+    "config": { "length_penalty": 1.1 },
+    "voice": {
+      "ref_audio_base64": "<base64 float32 PCM>",
+      "tts_ref_audio_base64": "<base64 float32 PCM>"
+    }
+  }
+}
+
+← session.created
+```
+
+**发送输入**
+
+```
+→ input.append
+{
+  "type": "input.append",
+  "input": {
+    "audio": "<base64 float32 PCM, 16kHz mono>",
+    "video_frames": ["<base64 JPEG>"],
+    "force_listen": false,
+    "max_slice_nums": 1
+  }
+}
+```
+
+**接收输出**
+
+| kind | 说明 |
+|------|------|
+| `listen` | 模型回到听状态，可继续发送输入 |
+| `text` | 文本增量 (`delta.text`) |
+| `audio` | 音频增量 (`delta.audio`, 24kHz float32 PCM base64) |
+
+```
+← response.output.delta { "kind": "listen", "session_id": "sess_xxx", "metrics": {...} }
+← response.output.delta { "kind": "text",   "text": "我看到了", "response_id": "resp_xxx" }
+← response.output.delta { "kind": "audio",  "audio": "<base64>", "response_id": "resp_xxx" }
+```
+
+输出边界由 `kind=listen` 表达，不使用 `response.done`。
+
+**时序**
+
+```
+connect → session.queued/queue_done → session.init → session.created
+  → input.append(audio+video) 循环
+  ← response.output.delta (listen / text / audio)
+  → session.close ← session.closed
+```
+
+### 10.2 音频双工 (`/v1/realtime?mode=audio`)
+
+纯语音双工, 无视频帧, 会话上限 600 秒。
+
+**连接**
+
+```
+wss://host/v1/realtime?mode=audio
+```
+
+**初始化** (同视频双工，无 video_frames)
+
+```
+→ session.init
+{
+  "type": "session.init",
+  "payload": {
+    "system_prompt": "你是一个有用的语音助手",
+    "config": { "length_penalty": 1.1 },
+    "voice": { "ref_audio_base64": "...", "tts_ref_audio_base64": "..." }
+  }
+}
+
+← session.created
+```
+
+**发送输入** (无 video_frames)
+
+```
+→ input.append
+{
+  "type": "input.append",
+  "input": {
+    "audio": "<base64 float32 PCM, 16kHz mono>",
+    "force_listen": false
+  }
+}
+```
+
+**时序** (同视频双工，不携带帧)
+
+### 10.3 协议要点
+
+| 要点 | 说明 |
+|------|------|
+| 状态判断 | `kind=listen` 表示模型在听, 可发新输入; `kind=text/audio` 表示模型在说 |
+| 关闭 | `session.close {reason}` → 服务端回复 `session.closed` |
+| 音频格式 | 上行 16kHz float32 PCM mono; 下行 24kHz float32 PCM mono |
+| 视频格式 | JPEG base64, 每帧 1 个切片 (`max_slice_nums=1`) |
+| 参考音频 | `ref_audio_base64` 给 LLM 做声纹; `tts_ref_audio_base64` 给 TTS (可复用) |
+
+### 10.4 C++ 实现对比
+
+| 环节 | Web (Realtime API) | C++ 单二进制 (gui.cpp) |
+|------|-------------------|----------------------|
+| 音频捕获 | AudioWorklet → base64 | ALSA `snd_pcm_readi` → PCM → WAV |
+| 画面捕获 | canvas → base64 JPEG | OpenCV `cv::imwrite` → JPEG |
+| 推理调用 | WebSocket JSON → gateway → worker | 直接 `stream_prefill()` + `stream_decode()` |
+| 状态管理 | `kind=listen` / `kind=text` / `kind=audio` | `text_cv.wait_for` 条件变量 |
 | TTS 播放 | base64 PCM → AudioContext | `ffmpeg concat` + `aplay` |
-| 零子进程 | ❌ Python 本身 + requests 库 | ✅ 单进程, 无外部依赖 |
 
-C++ 单二进制架构在推理效率上更优（直接 API 调用无 HTTP 开销），但功能等价于 Web 版本的 C++ 后端路径。
+C++ 版直接调用 libomni API，省去 WebSocket + HTTP 开销，协议逻辑等价。
 
-## 10. 演进历史
+## 11. llama-omni-server 编译与启动
+
+C++ 双工推理服务端, 提供 HTTP API 供 Python worker 调用。
+
+### 11.1 本地修改
+
+`tools/server/server-omni.cpp`: 修复 OpenSSL 编译下无 cert/key 时 `SSLServer::is_valid()` 返回 false 导致 `listen()` 失败的问题。
+
+```cpp
+// 原代码: SSLServer 无 cert/key 时 ctx_=nullptr → is_valid()=false → bind 失败
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+    httplib::SSLServer svr(params.ssl_file_cert.c_str(), params.ssl_file_key.c_str());
+#else
+    httplib::Server svr;
+#endif
+
+// 修改后: 无 cert/key 时自动降级为 plain HTTP
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+    const bool provide_ssl = params.ssl_file_cert.size() && params.ssl_file_key.size();
+    httplib::SSLServer svr_ssl(params.ssl_file_cert.c_str(), params.ssl_file_key.c_str());
+    httplib::Server svr_http;
+    httplib::Server & svr = (provide_ssl && svr_ssl.is_valid()) ? svr_ssl : svr_http;
+    if (!provide_ssl) { LOG_INF("SSL cert not provided, using plain HTTP\n"); }
+#else
+    httplib::Server svr;
+#endif
+```
+
+### 11.2 编译
+
+```bash
+# 源码位置: /opt/llama.cpp-omni
+cd /opt/llama.cpp-omni/build
+
+# 配置（启用 CUDA + Server）
+cmake .. \
+  -DLLAMA_BUILD_SERVER=ON \
+  -DGGML_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES="80;89"
+
+# 编译 llama-omni-server（仅增量编译该目标）
+cmake --build . --target llama-omni-server -j$(nproc)
+
+# 产物: build/bin/llama-omni-server
+```
+
+### 11.2 模型目录结构
+
+```
+/data/models/MiniCPM-o-4_5-gguf/
+├── MiniCPM-o-4_5-Q4_K_M.gguf       # 主模型
+├── vision/
+│   └── MiniCPM-o-4_5-vision-F16.gguf
+├── audio/
+│   └── MiniCPM-o-4_5-audio-F16.gguf
+├── tts/
+│   ├── MiniCPM-o-4_5-tts-F16.gguf
+│   └── MiniCPM-o-4_5-projector-F16.gguf
+└── token2wav-gguf/
+    ├── encoder.gguf
+    ├── flow_extra.gguf
+    ├── flow_matching.gguf
+    ├── hifigan2.gguf
+    └── prompt_cache.gguf
+```
+
+### 11.3 启动服务
+
+```bash
+# 启动 llama-omni-server (后端推理, 127.0.0.1:22500)
+/opt/llama.cpp-omni/build/bin/llama-omni-server \
+  -m /data/models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \
+  -ngl 99 \
+  --host 127.0.0.1 \
+  --port 22500
+
+# 启动 Python worker (转发到后端, 0.0.0.0:22400)
+cd /opt/friday/chat/web
+/data/venv/bin/python worker.py \
+  --host 0.0.0.0 \
+  --port 22400 \
+  --gpu-id 0 \
+  --backend-server-url http://127.0.0.1:22500
+
+# 启动 Gateway (WebSocket 入口, 0.0.0.0:8006)
+/data/venv/bin/python gateway.py \
+  --host 0.0.0.0 \
+  --port 8006 \
+  --workers cpp-worker-backend:22400
+  # 可选 --https --ssl-certfile certs/cert.pem --ssl-keyfile certs/key.pem
+```
+
+### 11.4 Docker 部署（参考）
+
+```bash
+cd /opt/friday/chat/web
+GGUF_MODEL_HOST_PATH=/data/models/MiniCPM-o-4_5-gguf \
+GATEWAY_HOST_PORT=8006 \
+CPP_GPU_ID=0 \
+docker compose -f docker-compose.cpp.yml up -d --build
+```
+
+## 12. 演进历史
 
 | 阶段 | 方案 | 结果 |
 |------|------|------|

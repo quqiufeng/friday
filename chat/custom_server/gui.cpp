@@ -74,18 +74,8 @@ static void make_silence_wav(const char *path) {
 static const char *g_rtsp_url = nullptr;
 
 static bool record_mic(const char *wav_path) {
-    // RTSP 摄像头麦克风: 用 ffmpeg 从视频流提取音频
-    if (g_rtsp_url && g_rtsp_url[0]) {
-        char cmd[1024];
-        snprintf(cmd, sizeof(cmd),
-            "ffmpeg -rtsp_transport tcp -i '%s' -t 1 -vn -acodec pcm_s16le "
-            "-ar 16000 -ac 1 -y '%s' 2>/dev/null", g_rtsp_url, wav_path);
-        int ret = system(cmd);
-        if (ret == 0) { printf("[rtsp] 音频捕获成功\n"); return true; }
-        printf("[rtsp] 音频捕获失败\n");
-    }
-    // 本地 ALSA 麦克风
-    static const char *devices[] = {"default", "plughw:2,0", "hw:1,0"};
+    // USB 摄像头麦克风 (plughw:2,0) 或本地 ALSA
+    static const char *devices[] = {"plughw:2,0", "default", "hw:1,0"};
     snd_pcm_t *handle = nullptr;
     for (auto d : devices) {
         if (snd_pcm_open(&handle, d, SND_PCM_STREAM_CAPTURE, 0) == 0) { printf("[alsa] 打开 %s 成功\n", d); break; }
@@ -139,8 +129,8 @@ static void ai_worker() {
     SYS("amixer -c 2 sset 'Mic Capture Volume' 7810 2>/dev/null");
     SYS("amixer -c 2 sset 'Mic Capture Switch' on 2>/dev/null");
     SYS("amixer -c 1 sset 'Auto-Mute Mode' Disabled 2>/dev/null");
-    SYS("amixer -c 3 cset numid=2 on 2>/dev/null");
-    SYS("amixer -c 3 cset numid=3 63 2>/dev/null");
+    SYS("amixer -c 3 sset 'PCM Playback Switch' on 2>/dev/null");
+    SYS("amixer -c 3 sset 'PCM Playback Volume' 63 2>/dev/null");
 
     // 模型初始化
     {
@@ -188,7 +178,12 @@ static void ai_worker() {
     // 摄像头初始化 (支持 RTSP 环境变量)
     const char *rtsp = getenv("CAMERA_RTSP_URL");
     g_rtsp_url = rtsp;
-    cv::VideoCapture cap(rtsp ? rtsp : "0");
+    cv::VideoCapture cap;
+    if (rtsp) {
+        cap.open(rtsp, cv::CAP_FFMPEG);
+    } else {
+        cap.open(0, cv::CAP_V4L2);
+    }
     if (!cap.isOpened()) {
         printf("[错误] 摄像头: %s\n", rtsp ? rtsp : "/dev/video0");
         std::lock_guard<std::mutex> lk(g_mtx);
@@ -214,8 +209,8 @@ static void ai_worker() {
 
     // 滴滴两声启动提示
     SYS("ffmpeg -y -f lavfi -i 'sine=frequency=880:duration=0.12' -ac 1 -ar 22050 /tmp/_beep.wav 2>/dev/null");
-    SYS("aplay -D plughw:0,3 /tmp/_beep.wav -q 2>/dev/null");
-    SYS("usleep 150000; aplay -D plughw:0,3 /tmp/_beep.wav -q 2>/dev/null &");
+    SYS(("aplay -D " + std::string(TTS_DEVICE) + " /tmp/_beep.wav -q 2>/dev/null").c_str());
+    SYS(("usleep 150000; aplay -D " + std::string(TTS_DEVICE) + " /tmp/_beep.wav -q 2>/dev/null &").c_str());
 
     // 摄像头采集线程
     std::thread cam_th([&cap]() {
