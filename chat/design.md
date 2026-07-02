@@ -126,6 +126,22 @@ aplay -D plughw:N,0 /path/to/test.wav
 static const char *TTS_DEVICE = "plughw:3,0";  // USB 音频设备
 ```
 
+### 启用 USB 音频设备
+
+```bash
+# 启用输出并调到最大音量
+amixer -c 3 sset 'PCM Playback Switch' on
+amixer -c 3 sset 'PCM Playback Volume' 63
+
+# 测试播放
+ffmpeg -y -f lavfi -i "sine=frequency=880:duration=0.2" -af "volume=3" \
+  -ac 1 -ar 48000 /tmp/_test.wav 2>/dev/null
+aplay -D plughw:3,0 /tmp/_test.wav
+
+# 滴滴两声
+aplay -D plughw:3,0 /tmp/_test.wav; sleep 0.25; aplay -D plughw:3,0 /tmp/_test.wav
+```
+
 ### 声卡 Auto-Mute
 Realtek ALC892 等声卡的 `Auto-Mute Mode` 默认启用，会导致后面板无声：
 ```bash
