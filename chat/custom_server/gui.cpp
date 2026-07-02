@@ -10,6 +10,7 @@
 #include <atomic>
 #include <algorithm>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <alsa/asoundlib.h>
 #include <opencv2/opencv.hpp>
 #include <SDL2/SDL.h>
@@ -17,6 +18,11 @@
 
 #include "omni.h"
 #include "common.h"
+extern "C" {
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
+}
 
 // ─── 全局状态 ──────────────────────────────────────────────────────
 static std::mutex g_mtx;
@@ -51,8 +57,8 @@ static void wake_check() {
     }
 }
 
-// ─── ALSA 录音 (直接 PCM，零子进程) ───────────────────────────
-static bool record_mic(const char *wav_path) {
+// ─── ALSA 录音 (直接 PCM，返回峰值) ────────────────────────────
+static int record_mic(const char *wav_path) {
     static const char *devices[] = {"plughw:2,0", "hw:1,0", "plughw:3,0", "default"};
     snd_pcm_t *handle = nullptr;
     for (auto d : devices) {
@@ -63,15 +69,12 @@ static bool record_mic(const char *wav_path) {
     int frames = 16000;
     if (handle) {
         snd_pcm_set_params(handle, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 1, 16000, 1, 500000);
-        if (snd_pcm_readi(handle, buf, frames) < 0) {
-            memset(buf, 0, sizeof(buf));
-        }
+        if (snd_pcm_readi(handle, buf, frames) < 0) memset(buf, 0, sizeof(buf));
         snd_pcm_close(handle);
     } else {
         memset(buf, 0, sizeof(buf));
     }
 
-    // 写 WAV 头 + PCM 数据
     auto le32 = [](int v) { return std::string{char(v), char(v>>8), char(v>>16), char(v>>24)}; };
     auto le16 = [](int v) { return std::string{char(v), char(v>>8)}; };
     int dsz = frames * 2;
@@ -85,12 +88,99 @@ static bool record_mic(const char *wav_path) {
         fwrite(buf, 2, frames, fp);
         fclose(fp);
     }
-    return handle != nullptr;
+
+    int peak = 0;
+    for (int i = 0; i < frames; i++) { int a = abs(buf[i]); if (a > peak) peak = a; }
+    return peak;
 }
 
-// ─── 合并并播放 TTS ─────────────────────────────────────────────
-// ─── 播放新生成的 TTS WAV ─────────────────────────────────────
-static void play_tts() {
+// ─── Lua 引擎 ─────────────────────────────────────────────────────
+static lua_State *g_L = nullptr;
+
+// Lua: mic_record(path) → peak (0-32768)
+static int l_mic_record(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+
+    static const char *devices[] = {"plughw:2,0", "hw:1,0", "plughw:3,0", "default"};
+    snd_pcm_t *handle = nullptr;
+    for (auto d : devices) {
+        if (snd_pcm_open(&handle, d, SND_PCM_STREAM_CAPTURE, 0) == 0) break;
+    }
+    short buf[16000];
+    int frames = 16000;
+    if (handle) {
+        snd_pcm_set_params(handle, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 1, 16000, 1, 500000);
+        if (snd_pcm_readi(handle, buf, frames) < 0) memset(buf, 0, sizeof(buf));
+        snd_pcm_close(handle);
+    } else {
+        memset(buf, 0, sizeof(buf));
+    }
+
+    auto le32 = [](int v) { return std::string{char(v), char(v>>8), char(v>>16), char(v>>24)}; };
+    auto le16 = [](int v) { return std::string{char(v), char(v>>8)}; };
+    int dsz = frames * 2;
+    FILE *fp = fopen(path, "wb");
+    if (fp) {
+        std::string h = "RIFF" + le32(36+dsz) + "WAVE" + "fmt " + le32(16) + le16(1) + le16(1)
+                      + le32(16000) + le32(32000) + le16(2) + le16(16) + "data" + le32(dsz);
+        fwrite(h.data(), 1, h.size(), fp);
+        fwrite(buf, 2, frames, fp);
+        fclose(fp);
+    }
+
+    // compute peak
+    int peak = 0;
+    for (int i = 0; i < frames; i++) { int a = abs(buf[i]); if (a > peak) peak = a; }
+    lua_pushinteger(L, peak);
+    return 1;
+}
+
+// Lua: frame_save(path) → boolean
+static int l_frame_save(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+    std::lock_guard<std::mutex> lk(g_mtx);
+    if (!g_frame.empty()) {
+        std::vector<uchar> jpg;
+        cv::imencode(".jpg", g_frame, jpg, {cv::IMWRITE_JPEG_QUALITY, 70});
+        FILE *fp = fopen(path, "wb");
+        if (fp) { fwrite(jpg.data(), 1, jpg.size(), fp); fclose(fp); }
+        lua_pushboolean(L, 1);
+    } else {
+        lua_pushboolean(L, 0);
+    }
+    return 1;
+}
+
+// Lua: model_infer(audio_path, img_path, idx) → text or empty
+static int l_model_infer(lua_State *L) {
+    const char *audio = luaL_checkstring(L, 1);
+    const char *img = luaL_checkstring(L, 2);
+    int idx = luaL_checkinteger(L, 3);
+
+    stream_prefill(g_ctx, audio, img, idx, 1);
+    stream_decode(g_ctx, "/tmp/omni_out2", idx);
+
+    std::string result;
+    {
+        std::unique_lock<std::mutex> lk(g_ctx->text_mtx);
+        g_ctx->text_cv.wait_for(lk, std::chrono::seconds(10), [&]() {
+            return !g_ctx->text_queue.empty() || g_ctx->text_done_flag;
+        });
+        while (!g_ctx->text_queue.empty()) {
+            auto txt = g_ctx->text_queue.front();
+            g_ctx->text_queue.pop_front();
+            if (!txt.empty() && txt != "__IS_LISTEN__" && txt != "__END_OF_TURN__") {
+                if (!result.empty()) result += "\n";
+                result += txt;
+            }
+        }
+    }
+    lua_pushstring(L, result.c_str());
+    return 1;
+}
+
+// Lua: tts_play() → nil
+static int l_tts_play(lua_State *) {
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
         "LAST=$(cat /tmp/tts_last 2>/dev/null || echo -1); "
@@ -98,11 +188,101 @@ static void play_tts() {
         "| sort -t_ -k2 -n | while read F; do "
         "N=$(echo \"$F\" | sed 's/.*wav_//;s/\\.wav//'); "
         "[ \"$N\" -gt \"$LAST\" ] 2>/dev/null || continue; "
-        "aplay -D %s -q \"$F\" </dev/null >/dev/null 2>&1; "
-        "echo \"$N\" > /tmp/tts_last; "
-        "done",
-        TTS_DEVICE);
+        "aplay -D plughw:0,3 -q \"$F\" </dev/null >/dev/null 2>&1; "
+        "echo \"$N\" > /tmp/tts_last; done");
     SYS(cmd);
+    return 0;
+}
+
+// Lua: ui_add_text(text) → nil
+static int l_ui_add_text(lua_State *L) {
+    const char *txt = luaL_checkstring(L, 1);
+    std::lock_guard<std::mutex> lk(g_mtx);
+    g_ai_texts.push_back(txt);
+    if (g_ai_texts.size() > 10) g_ai_texts.pop_front();
+    return 0;
+}
+
+// Lua: ui_set_status(text) → nil
+static int l_ui_set_status(lua_State *L) {
+    const char *s = luaL_checkstring(L, 1);
+    std::lock_guard<std::mutex> lk(g_mtx);
+    g_status = s;
+    return 0;
+}
+
+// Lua: sleep(ms) → nil
+static int l_sleep(lua_State *L) {
+    int ms = luaL_checkinteger(L, 1);
+    usleep(ms * 1000);
+    return 0;
+}
+
+static const struct luaL_Reg friday_lib[] = {
+    {"mic_record",    l_mic_record},
+    {"frame_save",    l_frame_save},
+    {"model_infer",   l_model_infer},
+    {"tts_play",      l_tts_play},
+    {"ui_add_text",   l_ui_add_text},
+    {"ui_set_status", l_ui_set_status},
+    {"sleep",         l_sleep},
+    {nullptr, nullptr},
+};
+
+static bool lua_init_engine() {
+    g_L = luaL_newstate();
+    if (!g_L) return false;
+    luaL_openlibs(g_L);
+
+    lua_getglobal(g_L, "_G");
+    luaL_setfuncs(g_L, friday_lib, 0);
+    lua_pop(g_L, 1);
+
+    if (luaL_dofile(g_L, "/opt/friday/chat/custom_server/scripts/friday.lua") != LUA_OK) {
+        fprintf(stderr, "[lua] 加载失败: %s\n", lua_tostring(g_L, -1));
+        return false;
+    }
+    return true;
+}
+
+static int lua_call_func(const char *name) {
+    lua_getglobal(g_L, name);
+    if (!lua_isfunction(g_L, -1)) { lua_pop(g_L, 1); return -1; }
+    if (lua_pcall(g_L, 0, 0, 0) != LUA_OK) {
+        fprintf(stderr, "[lua] %s: %s\n", name, lua_tostring(g_L, -1));
+        lua_pop(g_L, 1);
+        return -1;
+    }
+    return 0;
+}
+
+static int lua_call_on_should_infer(int idx, int peak) {
+    lua_getglobal(g_L, "on_should_infer");
+    if (!lua_isfunction(g_L, -1)) { lua_pop(g_L, 1); return 0; }
+    lua_pushinteger(g_L, idx);
+    lua_pushinteger(g_L, peak);
+    if (lua_pcall(g_L, 2, 1, 0) != LUA_OK) {
+        fprintf(stderr, "[lua] on_should_infer: %s\n", lua_tostring(g_L, -1));
+        lua_pop(g_L, 1);
+        return 0;
+    }
+    int ret = lua_toboolean(g_L, -1);
+    lua_pop(g_L, 1);
+    return ret;
+}
+
+static std::string lua_call_on_ai_format(const std::string &text) {
+    lua_getglobal(g_L, "on_ai_format");
+    if (!lua_isfunction(g_L, -1)) { lua_pop(g_L, 1); return text; }
+    lua_pushstring(g_L, text.c_str());
+    if (lua_pcall(g_L, 1, 1, 0) != LUA_OK) {
+        fprintf(stderr, "[lua] on_ai_format: %s\n", lua_tostring(g_L, -1));
+        lua_pop(g_L, 1);
+        return text;
+    }
+    std::string ret = lua_tostring(g_L, -1) ?: text;
+    lua_pop(g_L, 1);
+    return ret;
 }
 
 // ─── AI 工作线程 ───────────────────────────────────────────────
@@ -203,17 +383,42 @@ static void ai_worker() {
         }
     });
 
-    // 主推理循环 (每 10 秒推理一次)
+    // 加载 Lua 业务脚本
+    if (!lua_init_engine()) {
+        fprintf(stderr, "[错误] Lua 引擎初始化失败\n");
+        return;
+    }
+    time_t lua_mtime = 0;
+    const char *lua_path = "/opt/friday/chat/custom_server/scripts/friday.lua";
+
+    // 主循环 (业务逻辑由 Lua 脚本控制)
     int idx = 0;
-    time_t last_speak = 0;
     while (g_run) {
+        // 热更新检测
+        struct stat st;
+        if (stat(lua_path, &st) == 0 && st.st_mtime != lua_mtime) {
+            lua_mtime = st.st_mtime;
+            // reload Lua
+            lua_close(g_L); g_L = nullptr;
+            if (!lua_init_engine()) {
+                fprintf(stderr, "[lua] 热更新失败，使用旧脚本\n");
+            } else {
+                printf("[lua] 脚本热更新完成\n");
+            }
+        }
         wake_check();
         idx++;
         char img[64], wav[64];
         snprintf(img, sizeof(img), "/tmp/f_%d.jpg", idx);
         snprintf(wav, sizeof(wav), "/tmp/m_%d.wav", idx);
 
-        // 帧编码 (imencode 内存编码 → 写 tmpfs)
+        // 录音 (返回峰值)
+        int peak = 0;
+        {
+            peak = record_mic(wav);
+        }
+
+        // 保存帧
         {
             std::lock_guard<std::mutex> lk(g_mtx);
             if (!g_frame.empty()) {
@@ -224,48 +429,29 @@ static void ai_worker() {
             }
         }
 
-        // 录音
-        record_mic(wav);
-
-        // 检测声音峰值，判断是否有人说话
-        bool has_voice = false;
-        {
-            FILE *f = fopen(wav, "rb");
-            if (f) {
-                fseek(f, 0, SEEK_END); long sz = ftell(f);
-                if (sz > 44) {
-                    fseek(f, 44, SEEK_SET);
-                    int peak = 0;
-                    for (int i = 0; i < (sz-44)/2 && i < 16000; i++) {
-                        short s; if (fread(&s, 2, 1, f) != 1) break;
-                        int a = abs(s); if (a > peak) peak = a;
-                    }
-                    has_voice = peak > 3000;
-                }
-                fclose(f);
+        // Lua 决定是否推理
+        if (!lua_call_on_should_infer(idx, peak)) {
+            l_tts_play(nullptr);
+            {
+                std::lock_guard<std::mutex> lk(g_mtx);
+                g_status = lua_call_func("on_status_idle") == 0 ? "等待语音输入..." : g_status;
             }
-        }
-
-        // 只有首帧和用户说话时才推理
-        time_t now = time(nullptr);
-        if (!has_voice && idx > 1) {
-            play_tts();
-            std::lock_guard<std::mutex> lk(g_mtx);
-            g_status = "等待语音输入...";
             remove(img); remove(wav);
+            usleep(200000);
             continue;
         }
-        last_speak = now;
 
         {
             std::lock_guard<std::mutex> lk(g_mtx);
             g_status = "推理中...";
         }
 
+        // 推理
         stream_prefill(g_ctx, wav, img, idx, 1);
         stream_decode(g_ctx, "/tmp/omni_out2", idx);
 
-        // 等待 AI 文字回复 (用条件变量等待，和 server.cpp 一致)
+        // 获取 AI 回复
+        std::string ai_text;
         {
             std::unique_lock<std::mutex> lk(g_ctx->text_mtx);
             g_ctx->text_cv.wait_for(lk, std::chrono::seconds(10), [&]() {
@@ -275,18 +461,24 @@ static void ai_worker() {
                 auto txt = g_ctx->text_queue.front();
                 g_ctx->text_queue.pop_front();
                 if (!txt.empty() && txt != "__IS_LISTEN__" && txt != "__END_OF_TURN__") {
-                    printf("[AI] %s\n", txt.c_str());
-                    std::lock_guard<std::mutex> lk2(g_mtx);
-                    g_ai_texts.push_back(txt);
-                    if (g_ai_texts.size() > 5) g_ai_texts.pop_front();
+                    if (!ai_text.empty()) ai_text += "\n";
+                    ai_text += txt;
                 }
             }
         }
 
-        // 播放 TTS
-        play_tts();
+        // Lua 格式化并显示
+        if (!ai_text.empty()) {
+            std::string formatted = lua_call_on_ai_format(ai_text);
+            printf("[AI] %s\n", ai_text.c_str());
+            std::lock_guard<std::mutex> lk(g_mtx);
+            g_ai_texts.push_back(formatted);
+            if (g_ai_texts.size() > 10) g_ai_texts.pop_front();
+        }
 
-        // 恢复状态
+        // TTS
+        l_tts_play(nullptr);
+
         {
             std::lock_guard<std::mutex> lk(g_mtx);
             g_status = "运行中";
