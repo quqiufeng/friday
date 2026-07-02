@@ -1,4 +1,4 @@
-// gui2.cpp - MiniCPM-o 全双工视频语音系统 (直接链接 libomni)
+// gui.cpp - MiniCPM-o 全双工视频语音系统 (直接链接 libomni)
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -6,6 +6,7 @@
 #include <thread>
 #include <mutex>
 #include <deque>
+#include <vector>
 #include <atomic>
 #include <algorithm>
 #include <unistd.h>
@@ -196,10 +197,15 @@ static void ai_worker() {
         snprintf(img, sizeof(img), "/tmp/f_%d.jpg", idx);
         snprintf(wav, sizeof(wav), "/tmp/m_%d.wav", idx);
 
-        // 保存帧
+        // 帧编码 (imencode 内存编码 → 写 tmpfs)
         {
             std::lock_guard<std::mutex> lk(g_mtx);
-            if (!g_frame.empty()) cv::imwrite(img, g_frame);
+            if (!g_frame.empty()) {
+                std::vector<uchar> jpg;
+                cv::imencode(".jpg", g_frame, jpg, {cv::IMWRITE_JPEG_QUALITY, 70});
+                FILE *fp = fopen(img, "wb");
+                if (fp) { fwrite(jpg.data(), 1, jpg.size(), fp); fclose(fp); }
+            }
         }
 
         // 录音
