@@ -71,8 +71,21 @@ static void make_silence_wav(const char *path) {
 }
 
 // ─── ALSA 录音 (直接 PCM，返回是否成功) ───────────────────────
+static const char *g_rtsp_url = nullptr;
+
 static bool record_mic(const char *wav_path) {
-    static const char *devices[] = {"plughw:2,0", "default"};
+    // RTSP 摄像头麦克风: 用 ffmpeg 从视频流提取音频
+    if (g_rtsp_url && g_rtsp_url[0]) {
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd),
+            "ffmpeg -rtsp_transport tcp -i '%s' -t 1 -vn -acodec pcm_s16le "
+            "-ar 16000 -ac 1 -y '%s' 2>/dev/null", g_rtsp_url, wav_path);
+        int ret = system(cmd);
+        if (ret == 0) { printf("[rtsp] 音频捕获成功\n"); return true; }
+        printf("[rtsp] 音频捕获失败\n");
+    }
+    // 本地 ALSA 麦克风
+    static const char *devices[] = {"default", "plughw:2,0", "hw:1,0"};
     snd_pcm_t *handle = nullptr;
     for (auto d : devices) {
         if (snd_pcm_open(&handle, d, SND_PCM_STREAM_CAPTURE, 0) == 0) { printf("[alsa] 打开 %s 成功\n", d); break; }
@@ -89,13 +102,6 @@ static bool record_mic(const char *wav_path) {
     } else {
         printf("[alsa] 无法打开设备\n");
         memset(buf, 0, sizeof(buf));
-    }
-    // 音频放大 5x，让模型更关注语音
-    for (int i = 0; i < frames; i++) {
-        int v = buf[i] * 5;
-        if (v > 32767) v = 32767;
-        if (v < -32768) v = -32768;
-        buf[i] = v;
     }
     for (int i = 0; i < frames; i++) { int v = buf[i] * 5; if (v > 32767) v = 32767; if (v < -32768) v = -32768; buf[i] = v; }
     auto le32 = [](int v) { return std::string{char(v), char(v>>8), char(v>>16), char(v>>24)}; };
@@ -178,6 +184,7 @@ static void ai_worker() {
 
     // 摄像头初始化 (支持 RTSP 环境变量)
     const char *rtsp = getenv("CAMERA_RTSP_URL");
+    g_rtsp_url = rtsp;
     cv::VideoCapture cap(rtsp ? rtsp : "0");
     if (!cap.isOpened()) {
         printf("[错误] 摄像头: %s\n", rtsp ? rtsp : "/dev/video0");
