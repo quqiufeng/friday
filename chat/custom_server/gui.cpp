@@ -246,13 +246,12 @@ static void ai_worker() {
             }
         }
 
-        // 用户说话立即推理，否则每 15 秒自动描述一次
+        // 只有首帧和用户说话时才推理
         time_t now = time(nullptr);
-        bool cooldown_ok = (now - last_speak >= 15);
-        if (!has_voice && !cooldown_ok) {
+        if (!has_voice && idx > 1) {
             play_tts();
             std::lock_guard<std::mutex> lk(g_mtx);
-            g_status = has_voice ? "推理中..." : "运行中";
+            g_status = "等待语音输入...";
             remove(img); remove(wav);
             continue;
         }
