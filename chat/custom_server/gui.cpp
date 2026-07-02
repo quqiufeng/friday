@@ -286,7 +286,7 @@ static std::condition_variable g_audio_ready_cv;
 static std::atomic<bool> g_audio_ready{false};
 static char g_audio_wav[64];
 static char g_audio_img[64];
-static short g_audio_buf[16000];
+static short g_audio_buf[8000];
 static int g_audio_count = 0;
 static int g_audio_idx = 0;
 
@@ -309,21 +309,21 @@ static void capture_thread_func() {
         float gain = (peak < 1000) ? 4.0f : std::min(32767.0f / std::max(peak, 1), 3.0f);
         for (int i = 0; i < r; i++) { float v = chunk[i] * gain; if (v > 32767) v = 32767; if (v < -32768) v = -32768; chunk[i] = (short)v; }
         // 累加到环形缓冲
-        int n = std::min(r, 16000 - g_audio_count);
+        int n = std::min(r, 8000 - g_audio_count);
         memcpy(g_audio_buf + g_audio_count, chunk, n * 2);
         g_audio_count += n;
-        if (g_audio_count >= 16000) {
-            // 写 WAV
+        if (g_audio_count >= 8000) {
+            // 写 WAV (500ms)
             g_audio_idx++;
             snprintf(g_audio_wav, sizeof(g_audio_wav), "/tmp/m_%d.wav", g_audio_idx);
             snprintf(g_audio_img, sizeof(g_audio_img), "/tmp/f_%d.jpg", g_audio_idx);
             auto le32 = [](int v) { return std::string{char(v),char(v>>8),char(v>>16),char(v>>24)}; };
             auto le16 = [](int v) { return std::string{char(v),char(v>>8)}; };
-            int dsz = 16000 * 2;
+            int dsz = 8000 * 2;
             std::string h = "RIFF" + le32(36+dsz) + "WAVE" + "fmt " + le32(16) + le16(1) + le16(1)
                           + le32(16000) + le32(32000) + le16(2) + le16(16) + "data" + le32(dsz);
             FILE *fw = fopen(g_audio_wav, "wb");
-            if (fw) { fwrite(h.data(), 1, h.size(), fw); fwrite(g_audio_buf, 2, 16000, fw); fclose(fw); }
+            if (fw) { fwrite(h.data(), 1, h.size(), fw); fwrite(g_audio_buf, 2, 8000, fw); fclose(fw); }
             // 保存帧
             {
                 std::lock_guard<std::mutex> lk(g_mtx);
@@ -420,7 +420,7 @@ static void ai_worker() {
             FILE *f = fopen(g_audio_wav, "rb");
             if (f) {
                 fseek(f, 44, SEEK_SET);
-                for (int i = 0; i < 16000; i++) { short s; if (fread(&s, 2, 1, f) != 1) break; int a = abs(s); if (a > peak) peak = a; }
+                for (int i = 0; i < 8000; i++) { short s; if (fread(&s, 2, 1, f) != 1) break; int a = abs(s); if (a > peak) peak = a; }
                 fclose(f);
             }
         }
