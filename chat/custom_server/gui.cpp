@@ -1,4 +1,4 @@
-// gui2.cpp - MiniCPM-o 全双工视频语音系统 (直接链接 libomni)
+// gui.cpp - MiniCPM-o 全双工视频语音系统 (DuplexSession API)
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -9,6 +9,7 @@
 #include <atomic>
 #include <algorithm>
 #include <unistd.h>
+#include <dirent.h>
 #include <alsa/asoundlib.h>
 #include <opencv2/opencv.hpp>
 #include <SDL2/SDL.h>
@@ -93,7 +94,9 @@ static bool record_mic(const char *wav_path) {
         printf("[alsa] 无法打开设备\n");
         memset(buf, 0, sizeof(buf));
     }
-    for (int i = 0; i < frames; i++) { int v = buf[i] * 5; if (v > 32767) v = 32767; if (v < -32768) v = -32768; buf[i] = v; }
+    int peak_amp = 0; for (int i = 0; i < frames; i++) { int a = abs(buf[i]); if (a > peak_amp) peak_amp = a; }
+    float gain = (peak_amp < 1000) ? 4.0f : std::min(32767.0f / std::max(peak_amp, 1), 3.0f);
+    for (int i = 0; i < frames; i++) { float v = buf[i] * gain; if (v > 32767) v = 32767; if (v < -32768) v = -32768; buf[i] = (short)v; }
     auto le32 = [](int v) { return std::string{char(v), char(v>>8), char(v>>16), char(v>>24)}; };
     auto le16 = [](int v) { return std::string{char(v), char(v>>8)}; };
     int dsz = frames * 2;
@@ -108,207 +111,358 @@ static bool record_mic(const char *wav_path) {
     return r >= 0;
 }
 
-// ─── 播放 TTS ─────────────────────────────────────────────────
-static void play_tts() {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd),
-        "LAST=$(cat /tmp/tts_last 2>/dev/null || echo -1); "
-        "find /tmp/omni_out2 -name 'wav_*.wav' -type f 2>/dev/null "
-        "| sort -t_ -k2 -n | while read F; do "
-        "N=$(echo \"$F\" | sed 's/.*wav_//;s/\\.wav//'); "
-        "[ \"$N\" -gt \"$LAST\" ] 2>/dev/null || continue; "
-        "aplay -D %s -q \"$F\" </dev/null >/dev/null 2>&1; "
-        "echo \"$N\" > /tmp/tts_last; done",
-        TTS_DEVICE);
-    SYS(cmd);
+// ─── 过滤 think 标签 ────────────────────────────────────────
+static std::string strip_think(const std::string & s) {
+    std::string r = s;
+    for (;;) {
+        auto p = r.find("<think>");   if (p != std::string::npos) { r.erase(p, 7); continue; }
+        auto q = r.find("</think>");  if (q != std::string::npos) { r.erase(q, 8); continue; }
+        break;
+    }
+    return r;
 }
 
-// ─── AI 工作线程 ───────────────────────────────────────────────
+// ─── 直接 ALSA 播放 WAV (零子进程) ─────────────────────────
+static void alsa_play(const char *wav_path) {
+    FILE *fp = fopen(wav_path, "rb");
+    if (!fp) { printf("[TTS] 文件不存在: %s\n", wav_path); return; }
+    // 跳过 WAV 头 (44 bytes)
+    char hdr[44];
+    if (fread(hdr, 1, 44, fp) != 44) { fclose(fp); return; }
+    int sr = *(int*)(hdr + 24);
+    short channels = *(short*)(hdr + 22);
+    short bits = *(short*)(hdr + 34);
+    int data_bytes = *(int*)(hdr + 40);
+    if (data_bytes <= 0) { data_bytes = 1024 * 1024; } // fallback
+    int data_samples = data_bytes / (bits / 8);
+
+    int alsa_fmt = (bits == 16) ? SND_PCM_FORMAT_S16_LE : SND_PCM_FORMAT_S32_LE;
+    snd_pcm_t *handle = nullptr;
+    if (snd_pcm_open(&handle, TTS_DEVICE, SND_PCM_STREAM_PLAYBACK, 0) < 0) {
+        printf("[TTS] 无法打开 %s\n", TTS_DEVICE); fclose(fp); return;
+    }
+    snd_pcm_set_params(handle, (snd_pcm_format_t)alsa_fmt, SND_PCM_ACCESS_RW_INTERLEAVED,
+                       channels, sr, 1, 500000);
+
+    const int BUF = 4096;
+    short buf[BUF];
+    int total = 0;
+    while (total < data_samples && g_run) {
+        int n = std::min(BUF, data_samples - total);
+        int r = (int)fread(buf, bits / 8, n, fp);
+        if (r <= 0) break;
+        int written = 0;
+        while (written < r) {
+            int w = snd_pcm_writei(handle, buf + written, r - written);
+            if (w < 0) { snd_pcm_prepare(handle); continue; }
+            written += w;
+        }
+        total += r;
+    }
+    printf("[TTS] 播放完成: %s (%d samples, %d bytes)\n", wav_path, total, total * (bits / 8));
+    snd_pcm_drain(handle);
+    snd_pcm_close(handle);
+    fclose(fp);
+}
+
+// ─── ALSA 一次性播放多个 WAV (零子进程) ─────────────────────
+static void play_tts() {
+    if (!g_run) return;
+
+    // 读 last
+    FILE *f_last = fopen("/tmp/tts_last", "r");
+    int last = -1;
+    if (f_last) { fscanf(f_last, "%d", &last); fclose(f_last); }
+
+    // 扫描 tts_wav 目录
+    std::vector<std::string> files;
+    int max_n = last;
+    DIR *dir = opendir("/tmp/omni_out2/tts_wav");
+    if (!dir) return;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != nullptr) {
+        int n;
+        if (sscanf(ent->d_name, "wav_%d.wav", &n) == 1) {
+            if (n > last) {
+                files.push_back(ent->d_name);
+                if (n > max_n) max_n = n;
+            }
+        }
+    }
+    closedir(dir);
+    if (files.empty()) return;
+    // 按编号排序
+    std::sort(files.begin(), files.end(), [](const std::string &a, const std::string &b) {
+        int na = 0, nb = 0;
+        sscanf(a.c_str(), "wav_%d.wav", &na);
+        sscanf(b.c_str(), "wav_%d.wav", &nb);
+        return na < nb;
+    });
+
+    printf("[TTS] 播放 %zu 个文件:", files.size());
+    for (auto &f : files) printf(" %s", f.c_str());
+    printf("\n");
+
+    // 逐个 ALSA 直写
+    for (auto &f : files) {
+        std::string path = "/tmp/omni_out2/tts_wav/" + f;
+        alsa_play(path.c_str());
+        if (!g_run) break;
+    }
+
+    FILE *fw = fopen("/tmp/tts_last", "w");
+    if (fw) { fprintf(fw, "%d", max_n); fclose(fw); }
+}
+
+// ─── TTS 环形缓冲 + 后台播放线程 ────────────────────────────
+static const int TTS_RING_SIZE = 48000 * 10; // 10s @24kHz
+static float g_tts_ring[TTS_RING_SIZE];
+static std::atomic<int> g_tts_w{0}, g_tts_r{0};
+static std::atomic<bool> g_tts_active{false};
+static std::mutex g_tts_cv_mtx;
+static std::condition_variable g_tts_cv;
+
+static void tts_playback_thread() {
+    snd_pcm_t *h = nullptr;
+    if (snd_pcm_open(&h, TTS_DEVICE, SND_PCM_STREAM_PLAYBACK, 0) < 0) return;
+    snd_pcm_set_params(h, SND_PCM_FORMAT_FLOAT_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 1, 24000, 1, 500000);
+    // 预填充 100ms 静音防止启动爆音
+    std::vector<float> silence(2400, 0.0f);
+    snd_pcm_writei(h, silence.data(), 2400);
+
+    float buf[2400];
+    while (g_run) {
+        int r = g_tts_r.load();
+        int w = g_tts_w.load();
+        int avail = (w - r + TTS_RING_SIZE) % TTS_RING_SIZE;
+        if (avail == 0) {
+            if (!g_tts_active.load()) break; // 无数据且不活跃 → 退出
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        int take = std::min(avail, 2400);
+        for (int i = 0; i < take; i++)
+            buf[i] = g_tts_ring[(r + i) % TTS_RING_SIZE];
+        g_tts_r.store((r + take) % TTS_RING_SIZE);
+        int written = 0;
+        while (written < take) {
+            int wb = snd_pcm_writei(h, buf + written, take - written);
+            if (wb == -EPIPE) { snd_pcm_prepare(h); continue; }
+            if (wb < 0) break;
+            written += wb;
+        }
+    }
+    snd_pcm_drain(h);
+    snd_pcm_close(h);
+}
+
+static void tts_audio_cb(const float *samples, int n_samples, int sample_rate, bool is_final) {
+    if (!g_run || n_samples <= 0) return;
+    g_tts_active = true;
+    // 重采样到 24kHz（如果 sample_rate 不是 24kHz）
+    if (sample_rate != 24000) {
+        int out_len = n_samples * 24000 / sample_rate;
+        std::vector<float> resampled(out_len);
+        for (int i = 0; i < out_len; i++) {
+            float src = (float)i * sample_rate / 24000;
+            int si = (int)src; float frac = src - si;
+            if (si + 1 < n_samples) resampled[i] = samples[si] * (1 - frac) + samples[si + 1] * frac;
+            else resampled[i] = samples[std::min(si, n_samples - 1)];
+        }
+        samples = resampled.data();
+        n_samples = out_len;
+    }
+    int w = g_tts_w.load();
+    for (int i = 0; i < n_samples; i++) {
+        g_tts_ring[(w + i) % TTS_RING_SIZE] = samples[i];
+    }
+    g_tts_w.store((w + n_samples) % TTS_RING_SIZE);
+    if (is_final) { g_tts_active = false; g_tts_cv.notify_one(); }
+}
+
+// ─── 录音线程：100ms 非阻塞采集，累积 1s 推帧 ─────────────
+static std::mutex g_audio_ready_mtx;
+static std::condition_variable g_audio_ready_cv;
+static std::atomic<bool> g_audio_ready{false};
+static char g_audio_wav[64];
+static char g_audio_img[64];
+static short g_audio_buf[16000];
+static int g_audio_count = 0;
+static int g_audio_idx = 0;
+
+static void capture_thread_func() {
+    // 打开捕获设备
+    snd_pcm_t *cap = nullptr;
+    for (auto d : {"plughw:2,0", "default", "hw:1,0"}) {
+        if (snd_pcm_open(&cap, d, SND_PCM_STREAM_CAPTURE, 0) == 0) { printf("[alsa] 捕获 %s\n", d); break; }
+    }
+    if (!cap) { printf("[alsa] 无法打开捕获设备\n"); return; }
+    snd_pcm_set_params(cap, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 1, 16000, 1, 500000);
+
+    const int CHUNK = 1600; // 100ms
+    short chunk[CHUNK];
+    while (g_run) {
+        int r = snd_pcm_readi(cap, chunk, CHUNK);
+        if (r < 0) { snd_pcm_prepare(cap); continue; }
+        // 自适应增益
+        int peak = 0; for (int i = 0; i < r; i++) { int a = abs(chunk[i]); if (a > peak) peak = a; }
+        float gain = (peak < 1000) ? 4.0f : std::min(32767.0f / std::max(peak, 1), 3.0f);
+        for (int i = 0; i < r; i++) { float v = chunk[i] * gain; if (v > 32767) v = 32767; if (v < -32768) v = -32768; chunk[i] = (short)v; }
+        // 累加到环形缓冲
+        int n = std::min(r, 16000 - g_audio_count);
+        memcpy(g_audio_buf + g_audio_count, chunk, n * 2);
+        g_audio_count += n;
+        if (g_audio_count >= 16000) {
+            // 写 WAV
+            g_audio_idx++;
+            snprintf(g_audio_wav, sizeof(g_audio_wav), "/tmp/m_%d.wav", g_audio_idx);
+            snprintf(g_audio_img, sizeof(g_audio_img), "/tmp/f_%d.jpg", g_audio_idx);
+            auto le32 = [](int v) { return std::string{char(v),char(v>>8),char(v>>16),char(v>>24)}; };
+            auto le16 = [](int v) { return std::string{char(v),char(v>>8)}; };
+            int dsz = 16000 * 2;
+            std::string h = "RIFF" + le32(36+dsz) + "WAVE" + "fmt " + le32(16) + le16(1) + le16(1)
+                          + le32(16000) + le32(32000) + le16(2) + le16(16) + "data" + le32(dsz);
+            FILE *fw = fopen(g_audio_wav, "wb");
+            if (fw) { fwrite(h.data(), 1, h.size(), fw); fwrite(g_audio_buf, 2, 16000, fw); fclose(fw); }
+            // 保存帧
+            {
+                std::lock_guard<std::mutex> lk(g_mtx);
+                if (!g_frame.empty()) cv::imwrite(g_audio_img, g_frame);
+            }
+            printf("[mic] peak=%d%s\n", peak, peak > 3000 ? " 🔊人声" : peak > 500 ? " 环境音" : " 静音");
+            g_audio_count = 0;
+            g_audio_ready = true;
+            g_audio_ready_cv.notify_one();
+        }
+    }
+    snd_pcm_close(cap);
+}
+
+// ─── AI 工作线程 (DuplexSession API + 流式 TTS) ──────────────
 static void ai_worker() {
-    // 设置音频增益
     SYS("amixer -c 2 sset 'Mic Capture Volume' 7810 2>/dev/null");
     SYS("amixer -c 2 sset 'Mic Capture Switch' on 2>/dev/null");
     SYS("amixer -c 1 sset 'Auto-Mute Mode' Disabled 2>/dev/null");
     SYS("amixer -c 3 sset 'PCM Playback Switch' on 2>/dev/null");
     SYS("amixer -c 3 sset 'PCM Playback Volume' 63 2>/dev/null");
 
-    // 模型初始化
-    {
-        std::lock_guard<std::mutex> lk(g_mtx);
-        g_status = "加载模型中...";
-    }
+    const char *OUTPUT_DIR = "/tmp/omni_out2";
+    const char *REF_AUDIO  = "/opt/friday/chat/web/assets/ref_audio/ref_minicpm_signature.wav";
+
+    { std::lock_guard<std::mutex> lk(g_mtx); g_status = "加载模型中..."; }
 
     common_params p{};
     p.model.path = "/data/models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf";
     p.vpm_model = "/data/models/MiniCPM-o-4_5-gguf/vision/MiniCPM-o-4_5-vision-F16.gguf";
     p.apm_model = "/data/models/MiniCPM-o-4_5-gguf/audio/MiniCPM-o-4_5-audio-F16.gguf";
     p.tts_model = "/data/models/MiniCPM-o-4_5-gguf/tts/MiniCPM-o-4_5-tts-F16.gguf";
-    p.n_ctx = 8192;
-    p.n_gpu_layers = 99;
-    p.n_batch = 2048;
-    p.n_ubatch = 512;
-    p.use_mlock = false;
-    p.sampling.temp = 0.7;
-    p.n_predict = 512;
+    p.n_ctx = 8192; p.n_gpu_layers = 99; p.n_batch = 2048; p.n_ubatch = 512;
+    p.use_mlock = false; p.sampling.temp = 0.7; p.sampling.top_k = 50; p.sampling.top_p = 0.9; p.n_predict = 512;
 
     printf("[模型] omni_init ...\n");
-    g_ctx = omni_init(&p, 2, true, "/data/models/MiniCPM-o-4_5-gguf/tts",
-                      100, "gpu:0", true, nullptr, nullptr, "/tmp/omni_out2");
-    if (!g_ctx) {
-        printf("[错误] omni_init 失败\n");
-        std::lock_guard<std::mutex> lk(g_mtx);
-        g_status = "模型加载失败";
-        return;
-    }
+    g_ctx = omni_init(&p, 2, true, "/data/models/MiniCPM-o-4_5-gguf/tts", 100, "gpu:0", true, nullptr, nullptr, OUTPUT_DIR);
+    if (!g_ctx) { printf("[错误] omni_init 失败\n"); g_status = "模型加载失败"; return; }
     g_ctx->async = true;
-    g_ctx->force_listen_count = 0;
-    g_ctx->max_new_speak_tokens_per_chunk = 512;
-    g_ctx->listen_prob_scale = 0.5;
-    g_ctx->audio_voice_clone_prompt = "<|im_start|>system\n你是一个AI语音助手，听到用户说话时用中文回应。\n<|audio_start|>";
-    g_ctx->audio_assistant_prompt   = "<|audio_end|><|im_end|>\n";
-    g_ctx->omni_voice_clone_prompt  = "<|im_start|>system\n你必须仔细听用户的语音输入并根据内容用中文回应。忽略画面内容，专注于语音。\n<|audio_start|>";
-    g_ctx->omni_assistant_prompt    = "<|audio_end|><|im_end|>\n";
+    g_ctx->force_listen_count = 1;
+    g_ctx->max_new_speak_tokens_per_chunk = 200;
+    g_ctx->listen_prob_scale = -1.0;
+    g_ctx->length_penalty = 1.1;
+    g_ctx->language = "zh";
+    g_ctx->audio_output_cb = tts_audio_cb;
+    std::thread tts_play_th(tts_playback_thread);
+    tts_play_th.detach();
+    g_ctx->omni_voice_clone_prompt = "<|im_start|>system\n模仿音频样本的音色并生成新的内容。\n<|audio_start|>";
+    g_ctx->omni_assistant_prompt = "你是一个有用的语音助手，请仔细听用户的语音并回答问题，不要主动描述画面内容。全程只用中文回答，不要使用英文。请用高自然度的方式和用户聊天。";
     printf("[模型] 就绪\n");
 
-    // 声纹克隆
-    std::string ref_audio = "/opt/friday/chat/MiniCPM-o-Demo/assets/ref_audio/ref_minicpm_signature.wav";
-    stream_prefill(g_ctx, ref_audio, "", 0);
-    printf("[模型] 声纹设置完成\n");
-
-    // 摄像头初始化 (支持 RTSP 环境变量)
-    const char *rtsp = getenv("CAMERA_RTSP_URL");
-    g_rtsp_url = rtsp;
+    // 摄像头
+    const char *rtsp = getenv("CAMERA_RTSP_URL"); g_rtsp_url = rtsp;
     cv::VideoCapture cap;
-    if (rtsp) {
-        cap.open(rtsp, cv::CAP_FFMPEG);
-    } else {
-        cap.open(0, cv::CAP_V4L2);
-    }
-    if (!cap.isOpened()) {
-        printf("[错误] 摄像头: %s\n", rtsp ? rtsp : "/dev/video0");
-        std::lock_guard<std::mutex> lk(g_mtx);
-        g_status = "摄像头不可用";
-        return;
-    }
-    cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
-    cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
-    cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
-
-    cv::Mat first;
-    cap >> first;
-    if (first.empty()) {
-        printf("[错误] 无法获取首帧\n");
-        return;
-    }
-    {
-        std::lock_guard<std::mutex> lk(g_mtx);
-        g_frame = first.clone();
-        g_status = "运行中";
-    }
+    if (rtsp) cap.open(rtsp, cv::CAP_FFMPEG); else cap.open(0, cv::CAP_V4L2);
+    if (!cap.isOpened()) { printf("[错误] 摄像头\n"); g_status = "摄像头不可用"; return; }
+    cap.set(cv::CAP_PROP_FRAME_WIDTH, 640); cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480); cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+    cv::Mat first; cap >> first;
+    if (first.empty()) { printf("[错误] 首帧\n"); return; }
+    { std::lock_guard<std::mutex> lk(g_mtx); g_frame = first.clone(); g_status = "运行中"; }
     printf("[摄像头] 就绪 %dx%d\n", first.cols, first.rows);
 
-    // 滴滴两声启动提示
-    SYS("ffmpeg -y -f lavfi -i 'sine=frequency=880:duration=0.12' -ac 1 -ar 22050 /tmp/_beep.wav 2>/dev/null");
-    SYS(("aplay -D " + std::string(TTS_DEVICE) + " /tmp/_beep.wav -q 2>/dev/null").c_str());
-    SYS(("usleep 150000; aplay -D " + std::string(TTS_DEVICE) + " /tmp/_beep.wav -q 2>/dev/null &").c_str());
+    // 启动采集线程
+    std::thread cap_th(capture_thread_func);
 
     // 摄像头采集线程
     std::thread cam_th([&cap]() {
-        while (g_run) {
-            cv::Mat f;
-            cap >> f;
-            if (!f.empty()) {
-                std::lock_guard<std::mutex> lk(g_mtx);
-                g_frame = f.clone();
-            }
-            usleep(33000);
-        }
+        while (g_run) { cv::Mat f; cap >> f; if (!f.empty()) { std::lock_guard<std::mutex> lk(g_mtx); g_frame = f.clone(); } usleep(33000); }
     });
 
-    // 主推理循环
-    int idx = 0;
-    time_t last_infer_time = 0;
+    // DuplexSession
+    { std::lock_guard<std::mutex> lk(g_mtx); g_status = "启动会话..."; }
+    if (!omni_duplex_session_begin(g_ctx, REF_AUDIO, OUTPUT_DIR)) { printf("[错误] duplex begin 失败\n"); g_status = "会话启动失败"; return; }
+    printf("[Duplex] 会话已启动\n");
+
+    // 主循环
+    bool model_is_speaking = false;
+    int last_played_idx = 0;
     while (g_run) {
         wake_check();
-        idx++;
-        char img[64], wav[64];
-        snprintf(img, sizeof(img), "/tmp/f_%d.jpg", idx);
-        snprintf(wav, sizeof(wav), "/tmp/m_%d.wav", idx);
-
-        // 保存帧
+        // 等待 1s 音频就绪（最多等 200ms，非阻塞轮询）
         {
-            std::lock_guard<std::mutex> lk(g_mtx);
-            if (!g_frame.empty()) cv::imwrite(img, g_frame);
+            std::unique_lock<std::mutex> lk(g_audio_ready_mtx);
+            if (!g_audio_ready_cv.wait_for(lk, std::chrono::milliseconds(200), []{ return g_audio_ready.load(); })) {
+                // 超时：播放残留 TTS（如有）
+                continue;
+            }
+            g_audio_ready = false;
         }
 
-        // 录音
-        record_mic(wav);
-
-        // 检测音量峰值
+        // 读峰值判断 VAD
         int peak = 0;
         {
-            FILE *f = fopen(wav, "rb");
+            FILE *f = fopen(g_audio_wav, "rb");
             if (f) {
                 fseek(f, 44, SEEK_SET);
                 for (int i = 0; i < 16000; i++) { short s; if (fread(&s, 2, 1, f) != 1) break; int a = abs(s); if (a > peak) peak = a; }
                 fclose(f);
             }
         }
-        printf("[mic] peak=%d%s\n", peak, peak > 3000 ? " 人声" : "");
-
-        // 冷却+音量检测，防止自激
-        time_t now = time(nullptr);
-        if ((peak < 200 || now - last_infer_time < 5) && idx > 5) {
-            play_tts();
-            std::lock_guard<std::mutex> lk(g_mtx);
-            g_status = "等待语音输入...";
-            remove(img); remove(wav);
+        bool user_is_speaking = peak > 4000 && !g_tts_active;
+        if (!user_is_speaking && !model_is_speaking) {
+            { std::lock_guard<std::mutex> lk(g_mtx); g_status = "等待语音输入..."; }
+            remove(g_audio_wav); remove(g_audio_img);
             continue;
         }
+        if (user_is_speaking && model_is_speaking) { printf("[VAD] 打断\n"); model_is_speaking = false; }
 
-        last_infer_time = now;
-        {
-            std::lock_guard<std::mutex> lk(g_mtx);
-            g_status = "推理中...";
-        }
+        { std::lock_guard<std::mutex> lk(g_mtx); g_status = "推理中..."; }
 
-        // AI 推理
-        stream_prefill(g_ctx, wav, img, idx, 1);
-        stream_decode(g_ctx, "/tmp/omni_out2", idx);
-        clean_kvcache(g_ctx);
+        OmniDuplexFrame frame;
+        frame.aud_fname = g_audio_wav; frame.img_fname = g_audio_img;
+        frame.max_slice_nums = 1; frame.user_seq = g_audio_idx;
+        int64_t fid = omni_duplex_push_frame(g_ctx, frame);
+        if (fid < 0) break;
 
-        // 读取 AI 文字回复
-        {
-            std::lock_guard<std::mutex> lk(g_ctx->text_mtx);
-            while (!g_ctx->text_queue.empty()) {
-                auto txt = g_ctx->text_queue.front();
-                g_ctx->text_queue.pop_front();
-                if (!txt.empty() && txt != "__IS_LISTEN__" && txt != "__END_OF_TURN__") {
-                    printf("[AI] %s\n", txt.c_str());
-                    std::lock_guard<std::mutex> lk2(g_mtx);
-                    g_ai_texts.push_back(txt);
-                    if (g_ai_texts.size() > 5) g_ai_texts.pop_front();
-                }
+        OmniDuplexFrameResult result;
+        if (!omni_duplex_wait_next_frame(g_ctx, &result, 10000)) { remove(g_audio_wav); remove(g_audio_img); continue; }
+        if (!result.ok) { remove(g_audio_wav); remove(g_audio_img); continue; }
+
+        model_is_speaking = result.is_speak;
+        if (result.is_speak) {
+            std::string clean = strip_think(result.text);
+            if (!clean.empty()) {
+                printf("[AI] %s\n", clean.c_str());
+                std::lock_guard<std::mutex> lk(g_mtx);
+                g_ai_texts.push_back(clean);
+                if (g_ai_texts.size() > 5) g_ai_texts.pop_front();
             }
+            { std::lock_guard<std::mutex> lk(g_mtx); g_status = "运行中"; }
+        } else {
+            { std::lock_guard<std::mutex> lk(g_mtx); g_status = "聆听中..."; }
         }
-
-        // 播放 TTS
-        play_tts();
-
-        // 恢复状态
-        {
-            std::lock_guard<std::mutex> lk(g_mtx);
-            g_status = "运行中";
-        }
-
-        remove(img);
-        remove(wav);
-        usleep(200000);
+        remove(g_audio_wav); remove(g_audio_img);
     }
 
-    // 清理
+    omni_duplex_session_end(g_ctx);
     if (cam_th.joinable()) cam_th.join();
-    if (cap.isOpened()) cap.release();
+    if (cap_th.joinable()) cap_th.join();
     if (g_ctx) { /* omni_free crash bug, skip */ }
 }
 

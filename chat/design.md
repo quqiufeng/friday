@@ -487,16 +487,11 @@ C++ 双工推理服务端, 提供 HTTP API 供 Python worker 调用。
 
 ### 11.1 本地修改
 
-`tools/server/server-omni.cpp`: 修复 OpenSSL 编译下无 cert/key 时 `SSLServer::is_valid()` 返回 false 导致 `listen()` 失败的问题。
+#### `tools/server/server-omni.cpp` — SSL 降级
+
+修复 OpenSSL 编译下无 cert/key 时 `SSLServer::is_valid()` 返回 false 导致 `listen()` 失败的问题。
 
 ```cpp
-// 原代码: SSLServer 无 cert/key 时 ctx_=nullptr → is_valid()=false → bind 失败
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-    httplib::SSLServer svr(params.ssl_file_cert.c_str(), params.ssl_file_key.c_str());
-#else
-    httplib::Server svr;
-#endif
-
 // 修改后: 无 cert/key 时自动降级为 plain HTTP
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
     const bool provide_ssl = params.ssl_file_cert.size() && params.ssl_file_key.size();
@@ -508,6 +503,27 @@ C++ 双工推理服务端, 提供 HTTP API 供 Python worker 调用。
     httplib::Server svr;
 #endif
 ```
+
+#### `tools/omni/omni.cpp` — 移除 duplex 模式下的英文 prompt 硬编码
+
+`omni_init()` 和 `omni_set_language()` 在 `duplex_mode=true` 时会将 prompt 覆盖为英文 `"Streaming Duplex Conversation! You are a helpful assistant."`，导致调用方设置的中文 prompt 失效。
+
+修改：双工模式下不再覆盖 prompt，由调用方在 `omni_init` 之后自行设置。
+
+```cpp
+// 原代码 (omni_init, 约 line 4061):
+if (duplex_mode) {
+    ctx_omni->omni_voice_clone_prompt = "...Streaming Duplex Conversation...";
+    ctx_omni->omni_assistant_prompt   = "...";
+}
+
+// 修改后: 双工模式不覆盖 prompt
+if (duplex_mode) {
+    // 由调用方在 omni_init 之后设置 omni_voice_clone_prompt
+}
+```
+
+同同理修改 `omni_set_language()` 中 `duplex_mode` 分支。
 
 ### 11.2 编译
 
