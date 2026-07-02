@@ -227,12 +227,32 @@ static void ai_worker() {
         // 录音
         record_mic(wav);
 
-        // 冷却
+        // 检测声音峰值，判断是否有人说话
+        bool has_voice = false;
+        {
+            FILE *f = fopen(wav, "rb");
+            if (f) {
+                fseek(f, 0, SEEK_END); long sz = ftell(f);
+                if (sz > 44) {
+                    fseek(f, 44, SEEK_SET);
+                    int peak = 0;
+                    for (int i = 0; i < (sz-44)/2 && i < 16000; i++) {
+                        short s; if (fread(&s, 2, 1, f) != 1) break;
+                        int a = abs(s); if (a > peak) peak = a;
+                    }
+                    has_voice = peak > 3000;
+                }
+                fclose(f);
+            }
+        }
+
+        // 用户说话立即推理，否则每 15 秒自动描述一次
         time_t now = time(nullptr);
-        if (now - last_speak < 10) {
+        bool cooldown_ok = (now - last_speak >= 15);
+        if (!has_voice && !cooldown_ok) {
             play_tts();
             std::lock_guard<std::mutex> lk(g_mtx);
-            g_status = "运行中";
+            g_status = has_voice ? "推理中..." : "运行中";
             remove(img); remove(wav);
             continue;
         }
