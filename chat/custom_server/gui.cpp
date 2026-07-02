@@ -27,7 +27,6 @@ static std::atomic<time_t> g_wake_time{0};
 
 // AI 回复文字队列
 static std::deque<std::string> g_ai_texts;
-static std::atomic<bool> g_need_play_tts{false};  // TTS 播放信号
 static std::string g_status = "初始化中...";
 
 // TTS 播放设备
@@ -237,7 +236,6 @@ static void tts_playback_thread() {
         int w = g_tts_w.load();
         int avail = (w - r + TTS_RING_SIZE) % TTS_RING_SIZE;
         if (avail == 0) {
-            if (!g_tts_active.load()) break; // 无数据且不活跃 → 退出
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
@@ -281,20 +279,7 @@ static void tts_audio_cb(const float *samples, int n_samples, int sample_rate, b
     if (is_final) { g_tts_active = false; g_tts_cv.notify_one(); }
 }
 
-// ─── TTS 播放线程（独立运行，不阻塞主循环）─────────────────
-static void tts_play_thread() {
-    while (g_run) {
-        if (!g_need_play_tts.load()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue;
-        }
-        g_need_play_tts = false;
-        omni_duplex_drain_tts_audio(g_ctx, 60000, 3000);
-        play_tts();
-    }
-}
-
-// ─── 录音线程：100ms 采集，累积 500ms 推帧 ──────────────────
+// ─── 录音线程：100ms 非阻塞采集，累积 1s 推帧 ─────────────
 static std::mutex g_audio_ready_mtx;
 static std::condition_variable g_audio_ready_cv;
 static std::atomic<bool> g_audio_ready{false};
@@ -414,11 +399,6 @@ static void ai_worker() {
     printf("[Duplex] 会话已启动\n");
     { std::lock_guard<std::mutex> lk(g_mtx); g_status = "等待语音输入..."; }
 
-    // 启动 TTS 播放线程
-    SYS("rm -f /tmp/omni_out2/tts_wav/wav_*.wav /tmp/tts_last 2>/dev/null");
-    std::thread tts_th(tts_play_thread);
-    tts_th.detach();
-
     // 主循环
     bool speaking = false;
     int silent_frames = 0;
@@ -466,7 +446,6 @@ static void ai_worker() {
                 speak_buf.clear();
                 speaking = false;
                 silent_frames = 0;
-                g_need_play_tts = true;  // 通知 TTS 线程播放
             }
         }
         remove(g_audio_wav); remove(g_audio_img);
