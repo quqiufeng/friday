@@ -1,37 +1,38 @@
--- friday.lua - Friday AI 业务逻辑
--- 修改此文件后重启程序即可生效，无需重新编译
+-- friday.lua - Friday AI 主逻辑 (LuaJIT FFI)
+-- C++ 提供底层接口，Lua 控制全部业务流程
+-- 修改此文件无需编译，保存后自动热更新
 
-local VOLUME_THRESHOLD = 3000      -- 语音检测阈值
-local INIT_SILENCE_MS = 100         -- 初始化用静音时长(毫秒)
-local PROMPT = "Streaming Omni Conversation."
+local VOLUME_THRESHOLD = 3000
+local COOLDOWN_SEC = 8
 
--- ─── 初始化回调 ────────────────────────────────────────────────
-function on_init()
-    print("[lua] 脚本加载完成")
-    return PROMPT, INIT_SILENCE_MS
+-- ─── 主循环 (C++ 每帧调用) ────────────────────────────────────
+function on_tick(idx)
+    -- 录音，返回峰值
+    local peak = mic_record(string.format("/tmp/m_%d.wav", idx))
+
+    -- 存帧
+    frame_save(string.format("/tmp/f_%d.jpg", idx))
+
+    -- 决策: 首帧或说话才推理
+    if idx == 1 or peak > VOLUME_THRESHOLD then
+        ui_set_status("推理中...")
+        local text = model_infer(
+            string.format("/tmp/m_%d.wav", idx),
+            string.format("/tmp/f_%d.jpg", idx),
+            idx
+        )
+        if text ~= "" then
+            print("[AI] " .. text)
+            ui_add_text("🤖 " .. text)
+        end
+        tts_play()
+        ui_set_status("运行中")
+        sleep(COOLDOWN_SEC * 1000)
+    else
+        tts_play()
+        ui_set_status("等待语音输入...")
+    end
 end
 
--- ─── 是否推理 ──────────────────────────────────────────────────
-function on_should_infer(idx, peak)
-    if idx == 1 then return true end
-    if peak > VOLUME_THRESHOLD then return true end
-    return false
-end
-
--- ─── AI 文字格式化 ─────────────────────────────────────────────
-function on_ai_format(text)
-    return "🤖 " .. text
-end
-
--- ─── 状态文字 ──────────────────────────────────────────────────
-function on_status_idle()
-    return "等待语音输入..."
-end
-
-function on_status_infer()
-    return "推理中..."
-end
-
-function on_status_ready()
-    return "运行中"
-end
+-- ─── 初始化 ────────────────────────────────────────────────────
+print("[lua] Friday AI 脚本加载完成")

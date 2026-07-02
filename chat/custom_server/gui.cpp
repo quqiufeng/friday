@@ -391,101 +391,35 @@ static void ai_worker() {
     time_t lua_mtime = 0;
     const char *lua_path = "/opt/friday/chat/custom_server/scripts/friday.lua";
 
-    // 主循环 (业务逻辑由 Lua 脚本控制)
+    // 主循环: 由 Lua on_tick 驱动全部业务逻辑
     int idx = 0;
     while (g_run) {
         // 热更新检测
         struct stat st;
         if (stat(lua_path, &st) == 0 && st.st_mtime != lua_mtime) {
             lua_mtime = st.st_mtime;
-            // reload Lua
             lua_close(g_L); g_L = nullptr;
             if (!lua_init_engine()) {
-                fprintf(stderr, "[lua] 热更新失败，使用旧脚本\n");
+                fprintf(stderr, "[lua] 热更新失败\n");
             } else {
-                printf("[lua] 脚本热更新完成\n");
+                printf("[lua] 热更新完成\n");
             }
         }
         wake_check();
         idx++;
-        char img[64], wav[64];
-        snprintf(img, sizeof(img), "/tmp/f_%d.jpg", idx);
-        snprintf(wav, sizeof(wav), "/tmp/m_%d.wav", idx);
 
-        // 录音 (返回峰值)
-        int peak = 0;
-        {
-            peak = record_mic(wav);
-        }
-
-        // 保存帧
-        {
-            std::lock_guard<std::mutex> lk(g_mtx);
-            if (!g_frame.empty()) {
-                std::vector<uchar> jpg;
-                cv::imencode(".jpg", g_frame, jpg, {cv::IMWRITE_JPEG_QUALITY, 70});
-                FILE *fp = fopen(img, "wb");
-                if (fp) { fwrite(jpg.data(), 1, jpg.size(), fp); fclose(fp); }
+        // 调用 Lua on_tick(idx)，内部调用 C 接口完成全部操作
+        lua_getglobal(g_L, "on_tick");
+        if (lua_isfunction(g_L, -1)) {
+            lua_pushinteger(g_L, idx);
+            if (lua_pcall(g_L, 1, 0, 0) != LUA_OK) {
+                fprintf(stderr, "[lua] on_tick: %s\n", lua_tostring(g_L, -1));
+                lua_pop(g_L, 1);
             }
-        }
-
-        // Lua 决定是否推理
-        if (!lua_call_on_should_infer(idx, peak)) {
-            l_tts_play(nullptr);
-            {
-                std::lock_guard<std::mutex> lk(g_mtx);
-                g_status = lua_call_func("on_status_idle") == 0 ? "等待语音输入..." : g_status;
-            }
-            remove(img); remove(wav);
+        } else {
+            lua_pop(g_L, 1);
             usleep(200000);
-            continue;
         }
-
-        {
-            std::lock_guard<std::mutex> lk(g_mtx);
-            g_status = "推理中...";
-        }
-
-        // 推理
-        stream_prefill(g_ctx, wav, img, idx, 1);
-        stream_decode(g_ctx, "/tmp/omni_out2", idx);
-
-        // 获取 AI 回复
-        std::string ai_text;
-        {
-            std::unique_lock<std::mutex> lk(g_ctx->text_mtx);
-            g_ctx->text_cv.wait_for(lk, std::chrono::seconds(10), [&]() {
-                return !g_ctx->text_queue.empty() || g_ctx->text_done_flag;
-            });
-            while (!g_ctx->text_queue.empty()) {
-                auto txt = g_ctx->text_queue.front();
-                g_ctx->text_queue.pop_front();
-                if (!txt.empty() && txt != "__IS_LISTEN__" && txt != "__END_OF_TURN__") {
-                    if (!ai_text.empty()) ai_text += "\n";
-                    ai_text += txt;
-                }
-            }
-        }
-
-        // Lua 格式化并显示
-        if (!ai_text.empty()) {
-            std::string formatted = lua_call_on_ai_format(ai_text);
-            printf("[AI] %s\n", ai_text.c_str());
-            std::lock_guard<std::mutex> lk(g_mtx);
-            g_ai_texts.push_back(formatted);
-            if (g_ai_texts.size() > 10) g_ai_texts.pop_front();
-        }
-
-        // TTS
-        l_tts_play(nullptr);
-
-        {
-            std::lock_guard<std::mutex> lk(g_mtx);
-            g_status = "运行中";
-        }
-
-        remove(img);
-        remove(wav);
     }
 
     // 清理
