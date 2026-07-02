@@ -9,7 +9,6 @@
 #include <atomic>
 #include <algorithm>
 #include <unistd.h>
-#include <dirent.h>
 #include <alsa/asoundlib.h>
 #include <opencv2/opencv.hpp>
 #include <SDL2/SDL.h>
@@ -31,6 +30,7 @@ static std::string g_status = "初始化中...";
 
 // TTS 播放设备
 static const char *TTS_DEVICE = "plughw:3,0";
+static const char *g_rtsp_url = nullptr;
 
 #define SYS(cmd) do { if (system(cmd) != 0) {} } while(0)
 
@@ -51,66 +51,6 @@ static void wake_check() {
     }
 }
 
-// ─── 生成静音 WAV (16-bit PCM, 16kHz, 1s) ─────────────────────
-static void make_silence_wav(const char *path) {
-    auto L32 = [](int v) -> std::string {
-        return std::string{char(v), char(v >> 8), char(v >> 16), char(v >> 24)};
-    };
-    auto L16 = [](int v) -> std::string {
-        return std::string{char(v), char(v >> 8)};
-    };
-    int sr = 16000;
-    int samples = sr;
-    int data_size = samples * 2;
-    std::string w = "RIFF" + L32(36 + data_size) + "WAVE"
-                  + "fmt " + L32(16) + L16(1) + L16(1)
-                  + L32(sr) + L32(sr * 2) + L16(2) + L16(16)
-                  + "data" + L32(data_size)
-                  + std::string(data_size, '\0');
-    FILE *fp = fopen(path, "wb");
-    if (fp) { fwrite(w.data(), 1, w.size(), fp); fclose(fp); }
-}
-
-// ─── ALSA 录音 (直接 PCM，返回是否成功) ───────────────────────
-static const char *g_rtsp_url = nullptr;
-
-static bool record_mic(const char *wav_path) {
-    // USB 摄像头麦克风 (plughw:2,0) 或本地 ALSA
-    static const char *devices[] = {"plughw:2,0", "default", "hw:1,0"};
-    snd_pcm_t *handle = nullptr;
-    for (auto d : devices) {
-        if (snd_pcm_open(&handle, d, SND_PCM_STREAM_CAPTURE, 0) == 0) { printf("[alsa] 打开 %s 成功\n", d); break; }
-    }
-    short buf[16000];
-    int frames = 16000;
-    int r = -1;
-    if (handle) {
-        snd_pcm_set_params(handle, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 1, 16000, 1, 500000);
-        r = snd_pcm_readi(handle, buf, frames);
-        if (r < 0) { printf("[alsa] 读取错误: %s\n", snd_strerror(r)); memset(buf, 0, sizeof(buf)); }
-        else frames = r;
-        snd_pcm_close(handle);
-    } else {
-        printf("[alsa] 无法打开设备\n");
-        memset(buf, 0, sizeof(buf));
-    }
-    int peak_amp = 0; for (int i = 0; i < frames; i++) { int a = abs(buf[i]); if (a > peak_amp) peak_amp = a; }
-    float gain = (peak_amp < 1000) ? 4.0f : std::min(32767.0f / std::max(peak_amp, 1), 3.0f);
-    for (int i = 0; i < frames; i++) { float v = buf[i] * gain; if (v > 32767) v = 32767; if (v < -32768) v = -32768; buf[i] = (short)v; }
-    auto le32 = [](int v) { return std::string{char(v), char(v>>8), char(v>>16), char(v>>24)}; };
-    auto le16 = [](int v) { return std::string{char(v), char(v>>8)}; };
-    int dsz = frames * 2;
-    FILE *fp = fopen(wav_path, "wb");
-    if (fp) {
-        std::string h = "RIFF" + le32(36+dsz) + "WAVE" + "fmt " + le32(16) + le16(1) + le16(1)
-                      + le32(16000) + le32(32000) + le16(2) + le16(16) + "data" + le32(dsz);
-        fwrite(h.data(), 1, h.size(), fp);
-        fwrite(buf, 2, frames, fp);
-        fclose(fp);
-    }
-    return r >= 0;
-}
-
 // ─── 过滤 think 标签 ────────────────────────────────────────
 static std::string strip_think(const std::string & s) {
     std::string r = s;
@@ -122,105 +62,10 @@ static std::string strip_think(const std::string & s) {
     return r;
 }
 
-// ─── 直接 ALSA 播放 WAV (零子进程) ─────────────────────────
-static void alsa_play(const char *wav_path) {
-    FILE *fp = fopen(wav_path, "rb");
-    if (!fp) { printf("[TTS] 文件不存在: %s\n", wav_path); return; }
-    // 跳过 WAV 头 (44 bytes)
-    char hdr[44];
-    if (fread(hdr, 1, 44, fp) != 44) { fclose(fp); return; }
-    int sr = *(int*)(hdr + 24);
-    short channels = *(short*)(hdr + 22);
-    short bits = *(short*)(hdr + 34);
-    int data_bytes = *(int*)(hdr + 40);
-    if (data_bytes <= 0) { data_bytes = 1024 * 1024; } // fallback
-    int data_samples = data_bytes / (bits / 8);
-
-    int alsa_fmt = (bits == 16) ? SND_PCM_FORMAT_S16_LE : SND_PCM_FORMAT_S32_LE;
-    snd_pcm_t *handle = nullptr;
-    if (snd_pcm_open(&handle, TTS_DEVICE, SND_PCM_STREAM_PLAYBACK, 0) < 0) {
-        printf("[TTS] 无法打开 %s\n", TTS_DEVICE); fclose(fp); return;
-    }
-    snd_pcm_set_params(handle, (snd_pcm_format_t)alsa_fmt, SND_PCM_ACCESS_RW_INTERLEAVED,
-                       channels, sr, 1, 500000);
-
-    const int BUF = 4096;
-    short buf[BUF];
-    int total = 0;
-    while (total < data_samples && g_run) {
-        int n = std::min(BUF, data_samples - total);
-        int r = (int)fread(buf, bits / 8, n, fp);
-        if (r <= 0) break;
-        int written = 0;
-        while (written < r) {
-            int w = snd_pcm_writei(handle, buf + written, r - written);
-            if (w < 0) { snd_pcm_prepare(handle); continue; }
-            written += w;
-        }
-        total += r;
-    }
-    printf("[TTS] 播放完成: %s (%d samples, %d bytes)\n", wav_path, total, total * (bits / 8));
-    snd_pcm_drain(handle);
-    snd_pcm_close(handle);
-    fclose(fp);
-}
-
-// ─── ALSA 一次性播放多个 WAV (零子进程) ─────────────────────
-static void play_tts() {
-    if (!g_run) return;
-
-    // 读 last
-    FILE *f_last = fopen("/tmp/tts_last", "r");
-    int last = -1;
-    if (f_last) { fscanf(f_last, "%d", &last); fclose(f_last); }
-
-    // 扫描 tts_wav 目录
-    std::vector<std::string> files;
-    int max_n = last;
-    DIR *dir = opendir("/tmp/omni_out2/tts_wav");
-    if (!dir) return;
-    struct dirent *ent;
-    while ((ent = readdir(dir)) != nullptr) {
-        int n;
-        if (sscanf(ent->d_name, "wav_%d.wav", &n) == 1) {
-            if (n > last) {
-                files.push_back(ent->d_name);
-                if (n > max_n) max_n = n;
-            }
-        }
-    }
-    closedir(dir);
-    if (files.empty()) return;
-    // 按编号排序
-    std::sort(files.begin(), files.end(), [](const std::string &a, const std::string &b) {
-        int na = 0, nb = 0;
-        sscanf(a.c_str(), "wav_%d.wav", &na);
-        sscanf(b.c_str(), "wav_%d.wav", &nb);
-        return na < nb;
-    });
-
-    printf("[TTS] 播放 %zu 个文件:", files.size());
-    for (auto &f : files) printf(" %s", f.c_str());
-    printf("\n");
-
-    // 逐个 ALSA 直写
-    for (auto &f : files) {
-        std::string path = "/tmp/omni_out2/tts_wav/" + f;
-        alsa_play(path.c_str());
-        if (!g_run) break;
-    }
-
-    FILE *fw = fopen("/tmp/tts_last", "w");
-    if (fw) { fprintf(fw, "%d", max_n); fclose(fw); }
-}
-
 // ─── TTS 环形缓冲 + 后台播放线程 ────────────────────────────
-static const int TTS_RING_SIZE = 48000 * 10; // 10s @24kHz
+static const int TTS_RING_SIZE = 48000 * 10;
 static float g_tts_ring[TTS_RING_SIZE];
 static std::atomic<int> g_tts_w{0}, g_tts_r{0};
-static std::atomic<bool> g_tts_active{false};
-static std::mutex g_tts_cv_mtx;
-static std::condition_variable g_tts_cv;
 
 static void tts_playback_thread() {
     snd_pcm_t *h = nullptr;
@@ -257,7 +102,6 @@ static void tts_playback_thread() {
 
 static void tts_audio_cb(const float *samples, int n_samples, int sample_rate, bool is_final) {
     if (!g_run || n_samples <= 0) return;
-    g_tts_active = true;
     // 重采样到 24kHz（如果 sample_rate 不是 24kHz）
     if (sample_rate != 24000) {
         int out_len = n_samples * 24000 / sample_rate;
@@ -276,10 +120,9 @@ static void tts_audio_cb(const float *samples, int n_samples, int sample_rate, b
         g_tts_ring[(w + i) % TTS_RING_SIZE] = samples[i];
     }
     g_tts_w.store((w + n_samples) % TTS_RING_SIZE);
-    if (is_final) { g_tts_active = false; g_tts_cv.notify_one(); }
 }
 
-// ─── 录音线程：100ms 非阻塞采集，累积 1s 推帧 ─────────────
+// ─── 录音线程：100ms 采集，累积 500ms 推帧 ──────────────────
 static std::mutex g_audio_ready_mtx;
 static std::condition_variable g_audio_ready_cv;
 static std::atomic<bool> g_audio_ready{false};
