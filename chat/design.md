@@ -30,7 +30,8 @@
 |------|------|------|
 | **渲染层** | C++17 + SDL2 + SDL2_ttf + OpenCV | 30fps 摄像头画面、状态显示 |
 | **推理层** | C++ + libomni.so (llama.cpp-omni) | 视觉+音频推理、TTS 生成 |
-| **音频** | ALSA (aplay) | 播放 TTS WAV |
+| **音频捕获** | ALSA libasound | snd_pcm_readi 直接 PCM，零子进程 |
+| **音频播放** | ALSA aplay | 播放 TTS 合并 WAV |
 
 ## 3. 文件结构
 
@@ -59,18 +60,17 @@
 4. 摄像头初始化（OpenCV VideoCapture, 640x480）
 5. 启动摄像头采集线程（~30fps）
 
-### 4.2 推理循环
+### 4.2 推理循环 (流式)
 
 ```
-每 200ms:
-  1. 检查唤醒词标记
-  2. 保存当前帧为 JPEG
-  3. 录音 1 秒 (ALSA ffmpeg)
-  4. stream_prefill(audio, image)
-  5. stream_decode → LLM 生成
-  6. 等待 text_queue 输出 (条件变量)
-  7. 显示 AI 文字到底部状态栏
-  8. 合并本轮 TTS WAV 并播放 (ffmpeg concat + aplay)
+循环 (ALSA 阻塞读天然同步 ~1s/cycle):
+  1. ALSA snd_pcm_readi → PCM 内存 (零子进程)
+  2. cv::imwrite → JPEG tmpfs
+  3. stream_prefill(audio_file, image_file)
+  4. stream_decode → LLM 生成
+  5. text_cv.wait_for → 条件变量等 AI 回复
+  6. 显示 AI 文字到底部状态栏
+  7. play_tts_merge → ffmpeg concat + aplay
 ```
 
 ### 4.3 SDL2 界面

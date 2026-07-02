@@ -9,6 +9,7 @@
 #include <atomic>
 #include <algorithm>
 #include <unistd.h>
+#include <alsa/asoundlib.h>
 #include <opencv2/opencv.hpp>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
@@ -49,37 +50,41 @@ static void wake_check() {
     }
 }
 
-// ─── 生成静音 WAV (16-bit PCM, 16kHz, 1s) ─────────────────────
-static void make_silence_wav(const char *path) {
-    auto L32 = [](int v) -> std::string {
-        return std::string{char(v), char(v >> 8), char(v >> 16), char(v >> 24)};
-    };
-    auto L16 = [](int v) -> std::string {
-        return std::string{char(v), char(v >> 8)};
-    };
-    int sr = 16000;
-    int samples = sr;
-    int data_size = samples * 2;
-    std::string w = "RIFF" + L32(36 + data_size) + "WAVE"
-                  + "fmt " + L32(16) + L16(1) + L16(1)
-                  + L32(sr) + L32(sr * 2) + L16(2) + L16(16)
-                  + "data" + L32(data_size)
-                  + std::string(data_size, '\0');
-    FILE *fp = fopen(path, "wb");
-    if (fp) { fwrite(w.data(), 1, w.size(), fp); fclose(fp); }
-}
-
-// ─── 录音（多设备尝试）────────────────────────────────────────
+// ─── ALSA 录音 (直接 PCM，零子进程) ───────────────────────────
 static bool record_mic(const char *wav_path) {
-    static const char *devices[] = {"plughw:2,0", "hw:1,0", "hw:3,0", "default"};
-    char cmd[256];
+    static const char *devices[] = {"plughw:2,0", "hw:1,0", "plughw:3,0", "default"};
+    snd_pcm_t *handle = nullptr;
     for (auto d : devices) {
-        snprintf(cmd, sizeof(cmd),
-                 "ffmpeg -f alsa -ac 1 -ar 16000 -i %s -t 1 -y %s 2>/dev/null", d, wav_path);
-        if (system(cmd) == 0) return true;
+        if (snd_pcm_open(&handle, d, SND_PCM_STREAM_CAPTURE, 0) == 0) break;
     }
-    make_silence_wav(wav_path);
-    return false;
+
+    short buf[16000];
+    int frames = 16000;
+    if (handle) {
+        snd_pcm_set_params(handle, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 1, 16000, 1, 500000);
+        if (snd_pcm_readi(handle, buf, frames) < 0) {
+            memset(buf, 0, sizeof(buf));
+        }
+        snd_pcm_close(handle);
+    } else {
+        memset(buf, 0, sizeof(buf));
+    }
+
+    // 写 WAV 头 + PCM 数据
+    auto le32 = [](int v) { return std::string{char(v), char(v>>8), char(v>>16), char(v>>24)}; };
+    auto le16 = [](int v) { return std::string{char(v), char(v>>8)}; };
+    int dsz = frames * 2;
+    FILE *fp = fopen(wav_path, "wb");
+    if (fp) {
+        std::string h = "RIFF" + le32(36+dsz) + "WAVE"
+                      + "fmt " + le32(16) + le16(1) + le16(1)
+                      + le32(16000) + le32(32000) + le16(2) + le16(16)
+                      + "data" + le32(dsz);
+        fwrite(h.data(), 1, h.size(), fp);
+        fwrite(buf, 2, frames, fp);
+        fclose(fp);
+    }
+    return handle != nullptr;
 }
 
 // ─── 合并并播放 TTS ─────────────────────────────────────────────
@@ -239,7 +244,6 @@ static void ai_worker() {
 
         remove(img);
         remove(wav);
-        usleep(200000);
     }
 
     // 清理
