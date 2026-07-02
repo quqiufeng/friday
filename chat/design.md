@@ -126,7 +126,45 @@ OPENCV_LOG_LEVEL=DISABLED \
 | 窗口不显示 | SDL2 需要正确的 DISPLAY | `DISPLAY=:0` |
 | GPU 显存不足 | 残留进程占用 | `pkill -9 gui` 后重试 |
 
-## 9. 参考: Web 版本 (Python Demo) 双工数据流
+## 9. Web 版本 (Python Demo) 部署
+
+### 9.0 Python 环境
+
+```bash
+# 虚拟环境路径: /data/venv
+/data/venv/bin/python gateway.py
+/data/venv/bin/python worker.py --gpu 0 --port 22440
+```
+
+### 9.1 一键启动
+
+```bash
+cd /opt/friday/chat/MiniCPM-o-Demo
+bash start_all.sh
+```
+
+### 9.2 手动启动
+
+```bash
+# 终端 1: 启动 Gateway
+/data/venv/bin/python gateway.py
+
+# 终端 2: 启动 Worker（每张 GPU 一个）
+/data/venv/bin/python worker.py --gpu 0 --port 22440
+```
+
+### 9.3 配置文件
+
+`config.json` 中的关键字段：
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| `backend` | `"cpp"` | 推理后端 (cpp=GGUF, pytorch=HuggingFace) |
+| `model_dir` | `/data/models/MiniCPM-o-4_5-gguf` | GGUF 模型目录 |
+| `llm_model` | `MiniCPM-o-4_5-Q4_K_M.gguf` | 主模型文件 |
+| `cpp_server_port` | `19080` | llama-server 端口 |
+
+### 9.4 参考: 双工数据流
 
 官方 Demo (`MiniCPM-o-Demo/`) 基于 WebSocket 的双工推理流程，作为 C++ 实现的参考架构。
 
