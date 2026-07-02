@@ -29,7 +29,7 @@ static std::deque<std::string> g_ai_texts;
 static std::string g_status = "初始化中...";
 
 // TTS 播放设备
-static const char *TTS_DEVICE = "plughw:1,0";
+static const char *TTS_DEVICE = "plughw:3,0";
 
 #define SYS(cmd) do { if (system(cmd) != 0) {} } while(0)
 
