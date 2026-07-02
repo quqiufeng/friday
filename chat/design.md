@@ -607,6 +607,53 @@ docker compose -f docker-compose.cpp.yml up -d --build
 | v2 | C++ SDL2 + libomni (gui.cpp) | ✅ 单二进制，零依赖 |
 | v3 | C++ + LuaJIT (custom_server) | ✅ 可热更新脚本 |
 
+## 13. LuaJIT 脚本引擎
+
+### 13.1 编译集成
+
+```cmake
+pkg_check_modules(LUAJIT REQUIRED luajit)
+include_directories(${LUAJIT_INCLUDE_DIRS})
+target_link_libraries(gui PRIVATE ${LUAJIT_LIBRARIES})
+```
+
+LuaJIT 位于 `/usr/local/luajit`，cjson.so 在 `/usr/local/lualib/`。
+
+### 13.2 调用方式
+
+每次 MiniCPM-o 回复完整后被调用：
+
+```cpp
+// gui.cpp 中, 模型说完话后自动调用
+lua_getglobal(L, "on_reply");
+lua_pushstring(L, speak_buf.c_str());  // reply_text: 模型完整回复
+lua_pushstring(L, "/home/quqiufeng/friday.txt");  // log_path: 日志文件路径
+lua_pcall(L, 2, 0, 0);
+```
+
+### 13.3 Lua 脚本
+
+`scripts/friday.lua`（热更新，改完自动重载）：
+
+```lua
+-- 默认实现：打印回复日志
+function on_reply(reply_text, log_path)
+    print("[Friday] 收到回复: " .. reply_text:sub(1, 80) .. "...")
+    -- 可扩展：转发到 opencode 或其他模型 API
+end
+```
+
+### 13.4 热更新机制
+
+```cpp
+// 每次 on_reply 调用前检查 mtime，变化则自动 reload
+struct stat st;
+if (stat("scripts/friday.lua", &st) == 0 && st.st_mtime > lua_mtime) {
+    lua_mtime = st.st_mtime;
+    load_lua();  // 重新加载
+}
+```
+
 ## 总结
 
 **C++17 + SDL2 + libomni.so，三位一体。**

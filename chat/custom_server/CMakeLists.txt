@@ -9,12 +9,14 @@ pkg_check_modules(SDL2 REQUIRED sdl2)
 pkg_check_modules(SDL2_TTF REQUIRED SDL2_ttf)
 pkg_check_modules(OpenCV REQUIRED opencv4)
 pkg_check_modules(ALSA REQUIRED alsa)
+pkg_check_modules(LUAJIT REQUIRED luajit)
 
 # ─── 头文件 ────────────────────────────────────────────────────────
 include_directories(
     ${SDL2_INCLUDE_DIRS}
     ${SDL2_TTF_INCLUDE_DIRS}
     ${OpenCV_INCLUDE_DIRS}
+    ${LUAJIT_INCLUDE_DIRS}
     /opt/llama.cpp-omni
     /opt/llama.cpp-omni/common
     /opt/llama.cpp-omni/include
@@ -30,6 +32,7 @@ target_link_libraries(gui PRIVATE
     ${SDL2_TTF_LIBRARIES}
     ${OpenCV_LIBRARIES}
     ${ALSA_LIBRARIES}
+    ${LUAJIT_LIBRARIES}
     omni llama ggml ggml-base ggml-cpu ggml-cuda
     pthread dl m cuda
 )

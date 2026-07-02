@@ -9,6 +9,7 @@
 #include <atomic>
 #include <algorithm>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <alsa/asoundlib.h>
 #include <opencv2/opencv.hpp>
 #include <SDL2/SDL.h>
@@ -16,6 +17,8 @@
 
 #include "omni.h"
 #include "common.h"
+
+#include <lua.hpp>
 
 // ─── 全局状态 ──────────────────────────────────────────────────────
 static std::mutex g_mtx;
@@ -26,6 +29,7 @@ static std::atomic<time_t> g_wake_time{0};
 
 // AI 回复文字队列
 static std::deque<std::string> g_ai_texts;
+static int g_scroll_offset = 0;  // 0=最新在底部, >0=往上滚
 static std::string g_status = "初始化中...";
 
 // TTS 播放设备
@@ -243,8 +247,29 @@ static void ai_worker() {
     printf("[Duplex] 会话已启动\n");
     { std::lock_guard<std::mutex> lk(g_mtx); g_status = "等待语音输入..."; }
 
+    // ─── LuaJIT 初始化 ────────────────────────────────────────
+    lua_State *L = luaL_newstate();
+    luaL_openlibs(L);
+    lua_pushstring(L, "/usr/local/lualib/?.so;;");
+    lua_setglobal(L, "package.cpath");
+    lua_pushstring(L, "/opt/friday/chat/custom_server/scripts/?.lua;;");
+    lua_setglobal(L, "package.path");
+    time_t lua_mtime = 0;
+
+    auto load_lua = [&]() {
+        if (luaL_loadfile(L, "/opt/friday/chat/custom_server/scripts/friday.lua") || lua_pcall(L, 0, 0, 0)) {
+            printf("[Lua] 加载失败: %s\n", lua_tostring(L, -1));
+            lua_pop(L, 1);
+            return false;
+        }
+        printf("[Lua] friday.lua 就绪\n");
+        return true;
+    };
+    load_lua();
+
     // 主循环
     bool speaking = false;
+    int silent_frames = 0;
     std::string speak_buf;
     while (g_run) {
         wake_check();
@@ -274,16 +299,39 @@ static void ai_worker() {
         if (!result.ok) { remove(g_audio_wav); remove(g_audio_img); continue; }
 
         if (result.is_speak) {
+            silent_frames = 0;
             speaking = true;
             speak_buf += strip_think(result.text);
-            // 每帧即时显示累积文字（不等语音播完）
             printf("[AI] %s\n", speak_buf.c_str());
             std::lock_guard<std::mutex> lk(g_mtx);
             if (!g_ai_texts.empty()) g_ai_texts.pop_back();
             g_ai_texts.push_back(speak_buf);
+            g_scroll_offset = 0;  // 新文字自动滚到底部
         } else if (speaking) {
-            speaking = false;
-            speak_buf.clear();
+            silent_frames++;
+            // 连续 3 帧不说话才算说完
+            if (silent_frames >= 3) {
+                FILE *logf = fopen("/home/quqiufeng/friday.txt", "a");
+                if (logf) { fwrite(speak_buf.c_str(), 1, speak_buf.size(), logf); fputs("\n", logf); fclose(logf); }
+                // Lua 热更新 + 转发回复
+                struct stat st;
+                if (stat("/opt/friday/chat/custom_server/scripts/friday.lua", &st) == 0 && st.st_mtime > lua_mtime) {
+                    lua_mtime = st.st_mtime;
+                    load_lua();
+                }
+                lua_getglobal(L, "on_reply");
+                if (lua_isfunction(L, -1)) {
+                    lua_pushstring(L, speak_buf.c_str());
+                    lua_pushstring(L, "/home/quqiufeng/friday.txt");
+                    if (lua_pcall(L, 2, 0, 0)) {
+                        printf("[Lua] on_reply 错误: %s\n", lua_tostring(L, -1));
+                        lua_pop(L, 1);
+                    }
+                } else lua_pop(L, 1);
+                speaking = false;
+                silent_frames = 0;
+                speak_buf.clear();
+            }
         }
         remove(g_audio_wav); remove(g_audio_img);
     }
@@ -298,54 +346,46 @@ static void ai_worker() {
 static int render_text(SDL_Renderer *ren, TTF_Font *font, const std::string &text,
                        int x, int y, SDL_Color color, int max_width) {
     if (text.empty() || !font) return y;
-
-    // 自动换行
     std::string line;
     int yy = y;
     for (size_t i = 0; i < text.size(); ) {
-        // 处理 UTF-8 字符
         int len = 1;
         unsigned char c = text[i];
-        if (c >= 0xF0) len = 4;
-        else if (c >= 0xE0) len = 3;
-        else if (c >= 0xC0) len = 2;
-
-        std::string ch = text.substr(i, len);
-        i += len;
-
+        if (c >= 0xF0) len = 4; else if (c >= 0xE0) len = 3; else if (c >= 0xC0) len = 2;
+        std::string ch = text.substr(i, len); i += len;
         if (ch == "\n") {
             if (!line.empty()) {
                 auto surf = TTF_RenderUTF8_Blended(font, line.c_str(), color);
-                if (surf) {
-                    auto tex = SDL_CreateTextureFromSurface(ren, surf);
-                    SDL_Rect dst = {x, yy, surf->w, surf->h};
-                    SDL_RenderCopy(ren, tex, nullptr, &dst);
-                    SDL_DestroyTexture(tex);
-                    SDL_FreeSurface(surf);
-                    yy += surf->h + 2;
-                }
+                if (surf) { SDL_Rect dst = {x, yy, surf->w, surf->h}; SDL_RenderCopy(ren, SDL_CreateTextureFromSurface(ren, surf), nullptr, &dst); yy += surf->h + 2; SDL_FreeSurface(surf); }
                 line.clear();
             }
             continue;
         }
-
         line += ch;
-        int w;
-        TTF_SizeUTF8(font, line.c_str(), &w, nullptr);
+        int w; TTF_SizeUTF8(font, line.c_str(), &w, nullptr);
         if (w > max_width || i >= text.size()) {
             auto surf = TTF_RenderUTF8_Blended(font, line.c_str(), color);
-            if (surf) {
-                auto tex = SDL_CreateTextureFromSurface(ren, surf);
-                SDL_Rect dst = {x, yy, surf->w, surf->h};
-                SDL_RenderCopy(ren, tex, nullptr, &dst);
-                SDL_DestroyTexture(tex);
-                SDL_FreeSurface(surf);
-                yy += surf->h + 2;
-            }
+            if (surf) { SDL_Rect dst = {x, yy, surf->w, surf->h}; SDL_RenderCopy(ren, SDL_CreateTextureFromSurface(ren, surf), nullptr, &dst); yy += surf->h + 2; SDL_FreeSurface(surf); }
             line.clear();
         }
     }
     return yy;
+}
+
+// ─── 计算文字块占用的行数 ──────────────────────────────────
+static int count_lines(TTF_Font *font, const std::string &text, int max_width) {
+    int lines = 0; std::string line;
+    for (size_t i = 0; i < text.size(); ) {
+        int len = 1;
+        unsigned char c = text[i];
+        if (c >= 0xF0) len = 4; else if (c >= 0xE0) len = 3; else if (c >= 0xC0) len = 2;
+        std::string ch = text.substr(i, len); i += len;
+        if (ch == "\n") { if (!line.empty()) { lines++; line.clear(); } continue; }
+        line += ch;
+        int w; TTF_SizeUTF8(font, line.c_str(), &w, nullptr);
+        if (w > max_width || i >= text.size()) { lines++; line.clear(); }
+    }
+    return lines;
 }
 
 // ─── 主界面 ─────────────────────────────────────────────────────
@@ -402,6 +442,10 @@ int main(int, char **) {
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) quit = true;
             if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) quit = true;
+            if (ev.type == SDL_MOUSEWHEEL) {
+                g_scroll_offset -= ev.wheel.y * 3;
+                if (g_scroll_offset < 0) g_scroll_offset = 0;
+            }
         }
 
         SDL_RenderClear(ren);
@@ -452,9 +496,35 @@ int main(int, char **) {
                 std::lock_guard<std::mutex> lk(g_mtx);
                 if (!g_ai_texts.empty()) {
                     auto texts = g_ai_texts;
+                    // 计算总行数
+                    int total_lines = 0;
+                    for (auto &t : texts) total_lines += count_lines(font_small, t, W - 35);
+                    int max_visible = BH / 20;  // ~20px per line
+                    int max_scroll = std::max(0, total_lines - max_visible);
+                    if (g_scroll_offset > max_scroll) g_scroll_offset = max_scroll;
+                    // 渲染：从旧到新（底部是最新的），跳过 scrolled
                     int y = H - BH + 35;
-                    for (auto it = texts.rbegin(); it != texts.rend() && y < H - 8; ++it) {
-                        y = render_text(ren, font_small, *it, 10, y, white, W - 20) + 4;
+                    int lines_to_skip = g_scroll_offset;
+                    for (size_t idx = 0; idx < texts.size() && y < H - 8; idx++) {
+                        auto &t = texts[idx];
+                        if (lines_to_skip > 0) {
+                            int skip_lines = count_lines(font_small, t, W - 35);
+                            if (skip_lines <= lines_to_skip) { lines_to_skip -= skip_lines; continue; }
+                        }
+                        y = render_text(ren, font_small, t, 10, y, white, W - 35);
+                        if (y > H - 8) break;
+                    }
+                    // 滚动条
+                    if (max_scroll > 0) {
+                        int bar_top = H - BH + 30, bar_h = BH - 40;
+                        int thumb_h = std::max(20, bar_h * max_visible / total_lines);
+                        int thumb_y = bar_top + (bar_h - thumb_h) * g_scroll_offset / max_scroll;
+                        SDL_SetRenderDrawColor(ren, 60, 60, 60, 200);
+                        SDL_Rect track = {W - 12, bar_top, 8, bar_h};
+                        SDL_RenderFillRect(ren, &track);
+                        SDL_SetRenderDrawColor(ren, 160, 160, 160, 200);
+                        SDL_Rect thumb = {W - 12, thumb_y, 8, thumb_h};
+                        SDL_RenderFillRect(ren, &thumb);
                     }
                 }
             }
