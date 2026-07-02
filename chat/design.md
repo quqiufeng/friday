@@ -100,6 +100,7 @@ cp gui /opt/friday/chat/custom_server/gui
 
 ## 6. 运行
 
+### USB 摄像头
 ```bash
 LD_LIBRARY_PATH=/opt/llama.cpp-omni/build/bin \
 DISPLAY=:0 \
@@ -107,6 +108,24 @@ LIBGL_ALWAYS_SOFTWARE=1 \
 OPENCV_LOG_LEVEL=DISABLED \
 /opt/friday/chat/custom_server/gui
 ```
+
+### RTSP 网络摄像头 (TP-Link / 海康等)
+```bash
+CAMERA_RTSP_URL='rtsp://admin:密码@192.168.1.77:554/stream1' \
+LD_LIBRARY_PATH=/opt/llama.cpp-omni/build/bin \
+DISPLAY=:0 \
+LIBGL_ALWAYS_SOFTWARE=1 \
+OPENCV_LOG_LEVEL=DISABLED \
+/opt/friday/chat/custom_server/gui
+```
+
+RTSP 地址格式（TP-Link）：
+| 码流 | 地址 |
+|------|------|
+| 主码流 | `rtsp://admin:密码@IP:554/stream1` |
+| 子码流 | `rtsp://admin:密码@IP:554/stream2` |
+
+摄像头 RTSP 密码为设备本地管理员密码，非云端账号密码。
 
 ## 7. 硬件要求
 

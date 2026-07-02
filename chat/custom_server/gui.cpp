@@ -29,7 +29,7 @@ static std::deque<std::string> g_ai_texts;
 static std::string g_status = "初始化中...";
 
 // TTS 播放设备
-static const char *TTS_DEVICE = "plughw:0,3";
+static const char *TTS_DEVICE = "plughw:1,0";
 
 #define SYS(cmd) do { if (system(cmd) != 0) {} } while(0)
 
@@ -97,6 +97,7 @@ static bool record_mic(const char *wav_path) {
         if (v < -32768) v = -32768;
         buf[i] = v;
     }
+    for (int i = 0; i < frames; i++) { int v = buf[i] * 5; if (v > 32767) v = 32767; if (v < -32768) v = -32768; buf[i] = v; }
     auto le32 = [](int v) { return std::string{char(v), char(v>>8), char(v>>16), char(v>>24)}; };
     auto le16 = [](int v) { return std::string{char(v), char(v>>8)}; };
     int dsz = frames * 2;
@@ -162,7 +163,9 @@ static void ai_worker() {
     }
     g_ctx->async = true;
     g_ctx->force_listen_count = 0;
-    g_ctx->audio_voice_clone_prompt = "<|im_start|>system\n你必须仔细听用户的语音输入并根据内容用中文回应。忽略画面内容，专注于语音。\n<|audio_start|>";
+    g_ctx->max_new_speak_tokens_per_chunk = 512;
+    g_ctx->listen_prob_scale = 0.5;
+    g_ctx->audio_voice_clone_prompt = "<|im_start|>system\n你是一个AI语音助手，听到用户说话时用中文回应。\n<|audio_start|>";
     g_ctx->audio_assistant_prompt   = "<|audio_end|><|im_end|>\n";
     g_ctx->omni_voice_clone_prompt  = "<|im_start|>system\n你必须仔细听用户的语音输入并根据内容用中文回应。忽略画面内容，专注于语音。\n<|audio_start|>";
     g_ctx->omni_assistant_prompt    = "<|audio_end|><|im_end|>\n";
@@ -173,10 +176,11 @@ static void ai_worker() {
     stream_prefill(g_ctx, ref_audio, "", 0);
     printf("[模型] 声纹设置完成\n");
 
-    // 摄像头初始化
-    cv::VideoCapture cap(0);
+    // 摄像头初始化 (支持 RTSP 环境变量)
+    const char *rtsp = getenv("CAMERA_RTSP_URL");
+    cv::VideoCapture cap(rtsp ? rtsp : "0");
     if (!cap.isOpened()) {
-        printf("[错误] 摄像头\n");
+        printf("[错误] 摄像头: %s\n", rtsp ? rtsp : "/dev/video0");
         std::lock_guard<std::mutex> lk(g_mtx);
         g_status = "摄像头不可用";
         return;
