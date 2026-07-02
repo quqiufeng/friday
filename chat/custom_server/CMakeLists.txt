@@ -20,10 +20,11 @@ include_directories(
     /opt/llama.cpp-omni/ggml/include
     /opt/llama.cpp-omni/tools/omni
 )
+link_directories(/opt/llama.cpp-omni/build/bin)
 
 # ─── GUI2 主程序 (直接链接 libomni) ───────────────────────────────
-add_executable(gui2 gui2.cpp)
-target_link_libraries(gui2 PRIVATE
+add_executable(gui gui.cpp)
+target_link_libraries(gui PRIVATE
     ${SDL2_LIBRARIES}
     ${SDL2_TTF_LIBRARIES}
     ${OpenCV_LIBRARIES}

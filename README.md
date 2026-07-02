@@ -18,15 +18,6 @@
 
 [设计文档 →](chat/design.md)
 
-## 项目历程
-
-从 Web 界面 → C++ 二进制 → 单文件部署，跑在 Ubuntu 系统上。
-
-- 原版官方 Demo 基于 Python Web 服务
-- 重构为纯 C++ 二进制（gui2），直接链接 libomni.so
-- 支持 Lua 脚本热更新（custom_server/server.lua）
-- 最终形态：一个 190KB 二进制 + 播放脚本，零 Python 依赖
-
 ## 项目目的
 
 构建钢铁侠 Friday 式的全屋智能 AI 系统：
@@ -38,7 +29,7 @@
 | ⚡ **设备自动执行** | Lua 脚本热更新，对接 MQTT/HTTP/GPIO |
 | 🎙️ **统一入口** | 语音交互，一个 AI 管全家 |
 
-从 Web 界面 → C++ 二进制 → 单文件部署。
+单二进制部署，零 Python 依赖。
 
 ## 技术栈
 
@@ -46,38 +37,42 @@
 |------|------|------|
 | 模型推理 | MiniCPM-o 4.5 (GGUF Q4_K_M) | 9B 全双工多模态模型 |
 | 推理引擎 | llama.cpp-omni (libomni.so) | C++ 推理后端，直接链接 |
-| 摄像头 | USB / RTSP | OpenCV 或 FFmpeg 拉流 |
-| 语音合成 | 内置 CosyVoice2 TTS | 支持声纹克隆 |
+| 摄像头 | USB | OpenCV 拉流 |
+| 语音合成 | 内置 CosyVoice TTS | 支持声纹克隆 |
 | 音频播放 | ALSA (aplay) | HDMI/主板/USB 输出 |
-| GUI 窗口 | SDL2 + OpenCV | 摄像头画面显示 |
-| 脚本引擎 | LuaJIT | 热更新，业务逻辑可编程 |
+| GUI 窗口 | SDL2 + SDL2_ttf + OpenCV | 摄像头画面 + 状态栏 |
 | 编程语言 | C++17 | 零 Python 依赖 |
 
 ## 已实现功能
 
 - [x] USB 摄像头实时画面采集
 - [x] 麦克风收音（ALSA）
-- [x] 全双工视频语音推理（直接链接 libomni.so）
+- [x] 视频语音推理（直接链接 libomni.so）
 - [x] AI 实时描述画面内容
-- [x] TTS 语音合成播报（CosyVoice2，HDMI 输出）
+- [x] TTS 语音合成播报（CosyVoice，HDMI 输出）
 - [x] 声纹克隆（参考音频）
-- [x] SDL2 窗口显示摄像头画面
+- [x] SDL2 窗口显示摄像头画面 + 底部状态栏
 - [x] 单二进制部署，零 Python 依赖
-- [x] Lua 脚本热更新（业务逻辑可编程）
 
 ## 目录结构
 
 ```
 /opt/friday/
 ├── chat/
-│   ├── gui2                  # 主程序 (C++, 190KB)
-│   ├── gui2.cpp              # 源码
-│   ├── play_tts.sh           # 音频播放器
-│   ├── gui3.cpp              # HTTP 版 (备选)
-│   ├── cam_monitor.py        # 摄像头扫描 (测试用)
-│   ├── custom_server/        # C++ 工程
-│   ├── MiniCPM-o-Demo/       # 官方 Demo
-│   └── [design.md](chat/design.md)      # 设计文档
+│   ├── custom_server/
+│   │   ├── gui.cpp             # 主程序源码 (C++17)
+│   │   ├── gui                  # 编译后的二进制 (~75KB)
+│   │   ├── CMakeLists.txt       # 编译配置
+│   │   ├── main.cpp             # LuaJIT 服务端 (可选)
+│   │   ├── gateway.cpp/.h       # TCP 网关
+│   │   ├── lua_bridge.cpp/.h    # LuaJIT 绑定
+│   │   ├── camera.cpp/.h        # 摄像头模块
+│   │   ├── server.lua           # Lua 推理主循环
+│   │   └── scripts/             # Lua 业务脚本
+│   ├── MiniCPM-o-Demo/          # 官方 Python Demo
+│   ├── design.md                # 设计文档
+│   ├── wake.sh                  # "你好星期五" 唤醒词检测
+│   └── wake_confirm.wav         # 唤醒提示音
 ├── README.md
 └── LICENSE
 ```
@@ -85,11 +80,19 @@
 ## 快速运行
 
 ```bash
-# 启动推理
-LD_LIBRARY_PATH=/opt/llama.cpp-omni/build/bin /opt/friday/chat/gui2
+LD_LIBRARY_PATH=/opt/llama.cpp-omni/build/bin \
+DISPLAY=:0 \
+LIBGL_ALWAYS_SOFTWARE=1 \
+OPENCV_LOG_LEVEL=DISABLED \
+/opt/friday/chat/custom_server/gui
+```
 
-# 启动音频播放（新终端）
-bash /opt/friday/chat/play_tts.sh
+## 编译
+
+```bash
+mkdir -p /tmp/build_gui && cd /tmp/build_gui
+cmake /opt/friday/chat/custom_server -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
 ```
 
 ## 硬件要求
