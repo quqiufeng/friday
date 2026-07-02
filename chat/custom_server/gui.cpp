@@ -365,7 +365,7 @@ static void ai_worker() {
     g_ctx->async = true;
     g_ctx->force_listen_count = 1;
     g_ctx->max_new_speak_tokens_per_chunk = 200;
-    g_ctx->listen_prob_scale = -1.0;
+    g_ctx->listen_prob_scale = 1.0;
     g_ctx->length_penalty = 1.1;
     g_ctx->language = "zh";
     g_ctx->audio_output_cb = tts_audio_cb;
@@ -398,41 +398,28 @@ static void ai_worker() {
     { std::lock_guard<std::mutex> lk(g_mtx); g_status = "启动会话..."; }
     if (!omni_duplex_session_begin(g_ctx, REF_AUDIO, OUTPUT_DIR)) { printf("[错误] duplex begin 失败\n"); g_status = "会话启动失败"; return; }
     printf("[Duplex] 会话已启动\n");
+    { std::lock_guard<std::mutex> lk(g_mtx); g_status = "等待语音输入..."; }
 
     // 主循环
-    bool model_is_speaking = false;
-    int last_played_idx = 0;
+    bool speaking = false;
+    int silent_frames = 0;
+    std::string speak_buf;
     while (g_run) {
         wake_check();
-        // 等待 1s 音频就绪（最多等 200ms，非阻塞轮询）
         {
             std::unique_lock<std::mutex> lk(g_audio_ready_mtx);
-            if (!g_audio_ready_cv.wait_for(lk, std::chrono::milliseconds(200), []{ return g_audio_ready.load(); })) {
-                // 超时：播放残留 TTS（如有）
-                continue;
-            }
+            g_audio_ready_cv.wait_for(lk, std::chrono::milliseconds(500), []{ return g_audio_ready.load(); });
             g_audio_ready = false;
         }
 
-        // 读峰值判断 VAD
         int peak = 0;
-        {
-            FILE *f = fopen(g_audio_wav, "rb");
-            if (f) {
-                fseek(f, 44, SEEK_SET);
-                for (int i = 0; i < 8000; i++) { short s; if (fread(&s, 2, 1, f) != 1) break; int a = abs(s); if (a > peak) peak = a; }
-                fclose(f);
-            }
-        }
-        bool user_is_speaking = peak > 4000 && !g_tts_active;
-        if (!user_is_speaking && !model_is_speaking) {
+        { FILE *f = fopen(g_audio_wav, "rb"); if (f) { fseek(f, 44, SEEK_SET); short s; while (fread(&s, 2, 1, f) == 1) { int a = abs(s); if (a > peak) peak = a; } fclose(f); } }
+        if (peak < 300 && !speaking && speak_buf.empty()) {
             { std::lock_guard<std::mutex> lk(g_mtx); g_status = "等待语音输入..."; }
-            remove(g_audio_wav); remove(g_audio_img);
-            continue;
+            remove(g_audio_wav); remove(g_audio_img); continue;
         }
-        if (user_is_speaking && model_is_speaking) { printf("[VAD] 打断\n"); model_is_speaking = false; }
 
-        { std::lock_guard<std::mutex> lk(g_mtx); g_status = "推理中..."; }
+        { std::lock_guard<std::mutex> lk(g_mtx); g_status = speaking ? "AI 说话中..." : "推理中..."; }
 
         OmniDuplexFrame frame;
         frame.aud_fname = g_audio_wav; frame.img_fname = g_audio_img;
@@ -444,18 +431,23 @@ static void ai_worker() {
         if (!omni_duplex_wait_next_frame(g_ctx, &result, 10000)) { remove(g_audio_wav); remove(g_audio_img); continue; }
         if (!result.ok) { remove(g_audio_wav); remove(g_audio_img); continue; }
 
-        model_is_speaking = result.is_speak;
         if (result.is_speak) {
-            std::string clean = strip_think(result.text);
-            if (!clean.empty()) {
-                printf("[AI] %s\n", clean.c_str());
-                std::lock_guard<std::mutex> lk(g_mtx);
-                g_ai_texts.push_back(clean);
-                if (g_ai_texts.size() > 5) g_ai_texts.pop_front();
-            }
-            { std::lock_guard<std::mutex> lk(g_mtx); g_status = "运行中"; }
+            silent_frames = 0;
+            speaking = true;
+            speak_buf += strip_think(result.text);
         } else {
-            { std::lock_guard<std::mutex> lk(g_mtx); g_status = "聆听中..."; }
+            silent_frames++;
+            // 连续 3 帧不说话才 flush（避免一句话被拆开）
+            if (silent_frames >= 3 && !speak_buf.empty()) {
+                printf("[AI] %s\n", speak_buf.c_str());
+                std::lock_guard<std::mutex> lk(g_mtx);
+                g_ai_texts.push_back(speak_buf);
+                if (g_ai_texts.size() > 5) g_ai_texts.pop_front();
+                g_status = "等待语音输入...";
+                speak_buf.clear();
+                speaking = false;
+                silent_frames = 0;
+            }
         }
         remove(g_audio_wav); remove(g_audio_img);
     }
