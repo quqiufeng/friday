@@ -98,6 +98,41 @@ make -j$(nproc)
 cp gui /opt/friday/chat/custom_server/gui
 ```
 
+## 5.1 音频设备
+
+TTS 通过 ALSA `aplay` 播放，默认设备在源码 `TTS_DEVICE` 中配置。
+
+### 查看可用音频输出设备
+```bash
+aplay -l
+```
+
+输出示例：
+```
+card 0: NVidia [HDA NVidia], device 3: HDMI 0
+card 1: Generic [HD-Audio Generic], device 0: ALC892 Analog
+card 3: Rouyintianyuan4 [Rouyin-tianyuan-43198], device 0: USB Audio
+```
+
+### 测试音频输出
+```bash
+# 测试指定设备（将 N 替换为 card 编号）
+aplay -D plughw:N,0 /path/to/test.wav
+```
+
+### 配置 TTS 设备
+编辑 `gui.cpp` 中的 `TTS_DEVICE`，或直接修改源码中的设备名：
+```cpp
+static const char *TTS_DEVICE = "plughw:3,0";  // USB 音频设备
+```
+
+### 声卡 Auto-Mute
+Realtek ALC892 等声卡的 `Auto-Mute Mode` 默认启用，会导致后面板无声：
+```bash
+amixer -c 1 sset 'Auto-Mute Mode' Disabled
+```
+程序启动时会自动禁用。
+
 ## 6. 运行
 
 ### USB 摄像头
