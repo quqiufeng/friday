@@ -395,13 +395,13 @@ static void ai_worker() {
 
     // DuplexSession
     { std::lock_guard<std::mutex> lk(g_mtx); g_status = "启动会话..."; }
+    SYS("rm -f /tmp/omni_out2/tts_wav/wav_*.wav /tmp/tts_last 2>/dev/null");
     if (!omni_duplex_session_begin(g_ctx, REF_AUDIO, OUTPUT_DIR)) { printf("[错误] duplex begin 失败\n"); g_status = "会话启动失败"; return; }
     printf("[Duplex] 会话已启动\n");
     { std::lock_guard<std::mutex> lk(g_mtx); g_status = "等待语音输入..."; }
 
     // 主循环
     bool speaking = false;
-    int silent_frames = 0;
     std::string speak_buf;
     while (g_run) {
         wake_check();
@@ -431,22 +431,16 @@ static void ai_worker() {
         if (!result.ok) { remove(g_audio_wav); remove(g_audio_img); continue; }
 
         if (result.is_speak) {
-            silent_frames = 0;
             speaking = true;
             speak_buf += strip_think(result.text);
-        } else {
-            silent_frames++;
-            // 连续 3 帧不说话才 flush（避免一句话被拆开）
-            if (silent_frames >= 3 && !speak_buf.empty()) {
-                printf("[AI] %s\n", speak_buf.c_str());
-                std::lock_guard<std::mutex> lk(g_mtx);
-                g_ai_texts.push_back(speak_buf);
-                if (g_ai_texts.size() > 5) g_ai_texts.pop_front();
-                g_status = "等待语音输入...";
-                speak_buf.clear();
-                speaking = false;
-                silent_frames = 0;
-            }
+            // 每帧即时显示累积文字（不等语音播完）
+            printf("[AI] %s\n", speak_buf.c_str());
+            std::lock_guard<std::mutex> lk(g_mtx);
+            if (!g_ai_texts.empty()) g_ai_texts.pop_back();
+            g_ai_texts.push_back(speak_buf);
+        } else if (speaking) {
+            speaking = false;
+            speak_buf.clear();
         }
         remove(g_audio_wav); remove(g_audio_img);
     }
@@ -526,8 +520,8 @@ int main(int, char **) {
         return 1;
     }
 
-    int W = 960, H = 640;
-    SDL_Window *win = SDL_CreateWindow("Friday - MiniCPM-o",
+    int W = 1280, H = 720;
+    SDL_Window *win = SDL_CreateWindow("Friday 老秋专属",
                                         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                         W, H, SDL_WINDOW_RESIZABLE);
     if (!win) {
@@ -586,7 +580,7 @@ int main(int, char **) {
         }
 
         // 底部信息栏
-        int BH = 110;
+        int BH = 200;
         SDL_SetRenderDrawColor(ren, 0, 0, 0, 180);
         SDL_Rect panel = {0, H - BH, W, BH};
         SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
@@ -606,7 +600,7 @@ int main(int, char **) {
                 else if (status_text.find("加载") != std::string::npos || status_text.find("推理") != std::string::npos)
                     status_color = yellow;
             }
-            render_text(ren, font_small, "Friday AI · " + status_text, 10, H - BH + 8, status_color, W - 120);
+            render_text(ren, font_small, "老秋专属 · " + status_text, 10, H - BH + 8, status_color, W - 120);
 
             SDL_Color gray = {120, 120, 120, 255};
             render_text(ren, font_small, "ESC 退出", W - 100, H - BH + 8, gray, 100);
