@@ -1,4 +1,4 @@
-// gui.cpp - MiniCPM-o 全双工视频语音系统 (直接链接 libomni)
+// gui2.cpp - MiniCPM-o 全双工视频语音系统 (直接链接 libomni)
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -6,11 +6,9 @@
 #include <thread>
 #include <mutex>
 #include <deque>
-#include <vector>
 #include <atomic>
 #include <algorithm>
 #include <unistd.h>
-#include <sys/stat.h>
 #include <alsa/asoundlib.h>
 #include <opencv2/opencv.hpp>
 #include <SDL2/SDL.h>
@@ -18,11 +16,6 @@
 
 #include "omni.h"
 #include "common.h"
-extern "C" {
-#include <lua.h>
-#include <lauxlib.h>
-#include <lualib.h>
-}
 
 // ─── 全局状态 ──────────────────────────────────────────────────────
 static std::mutex g_mtx;
@@ -57,69 +50,57 @@ static void wake_check() {
     }
 }
 
-// ─── ALSA 录音 (直接 PCM，返回峰值) ────────────────────────────
-static int record_mic(const char *wav_path) {
-    static const char *devices[] = {"plughw:2,0", "hw:1,0", "plughw:3,0", "default"};
+// ─── 生成静音 WAV (16-bit PCM, 16kHz, 1s) ─────────────────────
+static void make_silence_wav(const char *path) {
+    auto L32 = [](int v) -> std::string {
+        return std::string{char(v), char(v >> 8), char(v >> 16), char(v >> 24)};
+    };
+    auto L16 = [](int v) -> std::string {
+        return std::string{char(v), char(v >> 8)};
+    };
+    int sr = 16000;
+    int samples = sr;
+    int data_size = samples * 2;
+    std::string w = "RIFF" + L32(36 + data_size) + "WAVE"
+                  + "fmt " + L32(16) + L16(1) + L16(1)
+                  + L32(sr) + L32(sr * 2) + L16(2) + L16(16)
+                  + "data" + L32(data_size)
+                  + std::string(data_size, '\0');
+    FILE *fp = fopen(path, "wb");
+    if (fp) { fwrite(w.data(), 1, w.size(), fp); fclose(fp); }
+}
+
+// ─── ALSA 录音 (直接 PCM，返回是否成功) ───────────────────────
+static bool record_mic(const char *wav_path) {
+    static const char *devices[] = {"plughw:2,0", "default"};
     snd_pcm_t *handle = nullptr;
     for (auto d : devices) {
-        if (snd_pcm_open(&handle, d, SND_PCM_STREAM_CAPTURE, 0) == 0) break;
+        if (snd_pcm_open(&handle, d, SND_PCM_STREAM_CAPTURE, 0) == 0) { printf("[alsa] 打开 %s 成功\n", d); break; }
     }
-
     short buf[16000];
     int frames = 16000;
+    int r = -1;
     if (handle) {
         snd_pcm_set_params(handle, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 1, 16000, 1, 500000);
-        if (snd_pcm_readi(handle, buf, frames) < 0) memset(buf, 0, sizeof(buf));
+        r = snd_pcm_readi(handle, buf, frames);
+        if (r < 0) { printf("[alsa] 读取错误: %s\n", snd_strerror(r)); memset(buf, 0, sizeof(buf)); }
+        else frames = r;
         snd_pcm_close(handle);
     } else {
+        printf("[alsa] 无法打开设备\n");
         memset(buf, 0, sizeof(buf));
     }
-
+    // 音频放大 5x，让模型更关注语音
+    for (int i = 0; i < frames; i++) {
+        int v = buf[i] * 5;
+        if (v > 32767) v = 32767;
+        if (v < -32768) v = -32768;
+        buf[i] = v;
+    }
     auto le32 = [](int v) { return std::string{char(v), char(v>>8), char(v>>16), char(v>>24)}; };
     auto le16 = [](int v) { return std::string{char(v), char(v>>8)}; };
     int dsz = frames * 2;
     FILE *fp = fopen(wav_path, "wb");
-    if (fp) {
-        std::string h = "RIFF" + le32(36+dsz) + "WAVE"
-                      + "fmt " + le32(16) + le16(1) + le16(1)
-                      + le32(16000) + le32(32000) + le16(2) + le16(16)
-                      + "data" + le32(dsz);
-        fwrite(h.data(), 1, h.size(), fp);
-        fwrite(buf, 2, frames, fp);
-        fclose(fp);
-    }
-
-    int peak = 0;
-    for (int i = 0; i < frames; i++) { int a = abs(buf[i]); if (a > peak) peak = a; }
-    return peak;
-}
-
-// ─── Lua 引擎 ─────────────────────────────────────────────────────
-static lua_State *g_L = nullptr;
-
-// Lua: mic_record(path) → peak (0-32768)
-static int l_mic_record(lua_State *L) {
-    const char *path = luaL_checkstring(L, 1);
-
-    static const char *devices[] = {"plughw:2,0", "hw:1,0", "plughw:3,0", "default"};
-    snd_pcm_t *handle = nullptr;
-    for (auto d : devices) {
-        if (snd_pcm_open(&handle, d, SND_PCM_STREAM_CAPTURE, 0) == 0) break;
-    }
-    short buf[16000];
-    int frames = 16000;
-    if (handle) {
-        snd_pcm_set_params(handle, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 1, 16000, 1, 500000);
-        if (snd_pcm_readi(handle, buf, frames) < 0) memset(buf, 0, sizeof(buf));
-        snd_pcm_close(handle);
-    } else {
-        memset(buf, 0, sizeof(buf));
-    }
-
-    auto le32 = [](int v) { return std::string{char(v), char(v>>8), char(v>>16), char(v>>24)}; };
-    auto le16 = [](int v) { return std::string{char(v), char(v>>8)}; };
-    int dsz = frames * 2;
-    FILE *fp = fopen(path, "wb");
     if (fp) {
         std::string h = "RIFF" + le32(36+dsz) + "WAVE" + "fmt " + le32(16) + le16(1) + le16(1)
                       + le32(16000) + le32(32000) + le16(2) + le16(16) + "data" + le32(dsz);
@@ -127,60 +108,11 @@ static int l_mic_record(lua_State *L) {
         fwrite(buf, 2, frames, fp);
         fclose(fp);
     }
-
-    // compute peak
-    int peak = 0;
-    for (int i = 0; i < frames; i++) { int a = abs(buf[i]); if (a > peak) peak = a; }
-    lua_pushinteger(L, peak);
-    return 1;
+    return r >= 0;
 }
 
-// Lua: frame_save(path) → boolean
-static int l_frame_save(lua_State *L) {
-    const char *path = luaL_checkstring(L, 1);
-    std::lock_guard<std::mutex> lk(g_mtx);
-    if (!g_frame.empty()) {
-        std::vector<uchar> jpg;
-        cv::imencode(".jpg", g_frame, jpg, {cv::IMWRITE_JPEG_QUALITY, 70});
-        FILE *fp = fopen(path, "wb");
-        if (fp) { fwrite(jpg.data(), 1, jpg.size(), fp); fclose(fp); }
-        lua_pushboolean(L, 1);
-    } else {
-        lua_pushboolean(L, 0);
-    }
-    return 1;
-}
-
-// Lua: model_infer(audio_path, img_path, idx) → text or empty
-static int l_model_infer(lua_State *L) {
-    const char *audio = luaL_checkstring(L, 1);
-    const char *img = luaL_checkstring(L, 2);
-    int idx = luaL_checkinteger(L, 3);
-
-    stream_prefill(g_ctx, audio, img, idx, 1);
-    stream_decode(g_ctx, "/tmp/omni_out2", idx);
-
-    std::string result;
-    {
-        std::unique_lock<std::mutex> lk(g_ctx->text_mtx);
-        g_ctx->text_cv.wait_for(lk, std::chrono::seconds(10), [&]() {
-            return !g_ctx->text_queue.empty() || g_ctx->text_done_flag;
-        });
-        while (!g_ctx->text_queue.empty()) {
-            auto txt = g_ctx->text_queue.front();
-            g_ctx->text_queue.pop_front();
-            if (!txt.empty() && txt != "__IS_LISTEN__" && txt != "__END_OF_TURN__") {
-                if (!result.empty()) result += "\n";
-                result += txt;
-            }
-        }
-    }
-    lua_pushstring(L, result.c_str());
-    return 1;
-}
-
-// Lua: tts_play() → nil
-static int l_tts_play(lua_State *) {
+// ─── 播放 TTS ─────────────────────────────────────────────────
+static void play_tts() {
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
         "LAST=$(cat /tmp/tts_last 2>/dev/null || echo -1); "
@@ -188,108 +120,17 @@ static int l_tts_play(lua_State *) {
         "| sort -t_ -k2 -n | while read F; do "
         "N=$(echo \"$F\" | sed 's/.*wav_//;s/\\.wav//'); "
         "[ \"$N\" -gt \"$LAST\" ] 2>/dev/null || continue; "
-        "aplay -D plughw:0,3 -q \"$F\" </dev/null >/dev/null 2>&1; "
-        "echo \"$N\" > /tmp/tts_last; done");
+        "aplay -D %s -q \"$F\" </dev/null >/dev/null 2>&1; "
+        "echo \"$N\" > /tmp/tts_last; done",
+        TTS_DEVICE);
     SYS(cmd);
-    return 0;
-}
-
-// Lua: ui_add_text(text) → nil
-static int l_ui_add_text(lua_State *L) {
-    const char *txt = luaL_checkstring(L, 1);
-    std::lock_guard<std::mutex> lk(g_mtx);
-    g_ai_texts.push_back(txt);
-    if (g_ai_texts.size() > 10) g_ai_texts.pop_front();
-    return 0;
-}
-
-// Lua: ui_set_status(text) → nil
-static int l_ui_set_status(lua_State *L) {
-    const char *s = luaL_checkstring(L, 1);
-    std::lock_guard<std::mutex> lk(g_mtx);
-    g_status = s;
-    return 0;
-}
-
-// Lua: sleep(ms) → nil
-static int l_sleep(lua_State *L) {
-    int ms = luaL_checkinteger(L, 1);
-    usleep(ms * 1000);
-    return 0;
-}
-
-static const struct luaL_Reg friday_lib[] = {
-    {"mic_record",    l_mic_record},
-    {"frame_save",    l_frame_save},
-    {"model_infer",   l_model_infer},
-    {"tts_play",      l_tts_play},
-    {"ui_add_text",   l_ui_add_text},
-    {"ui_set_status", l_ui_set_status},
-    {"sleep",         l_sleep},
-    {nullptr, nullptr},
-};
-
-static bool lua_init_engine() {
-    g_L = luaL_newstate();
-    if (!g_L) return false;
-    luaL_openlibs(g_L);
-
-    lua_getglobal(g_L, "_G");
-    luaL_setfuncs(g_L, friday_lib, 0);
-    lua_pop(g_L, 1);
-
-    if (luaL_dofile(g_L, "/opt/friday/chat/custom_server/scripts/friday.lua") != LUA_OK) {
-        fprintf(stderr, "[lua] 加载失败: %s\n", lua_tostring(g_L, -1));
-        return false;
-    }
-    return true;
-}
-
-static int lua_call_func(const char *name) {
-    lua_getglobal(g_L, name);
-    if (!lua_isfunction(g_L, -1)) { lua_pop(g_L, 1); return -1; }
-    if (lua_pcall(g_L, 0, 0, 0) != LUA_OK) {
-        fprintf(stderr, "[lua] %s: %s\n", name, lua_tostring(g_L, -1));
-        lua_pop(g_L, 1);
-        return -1;
-    }
-    return 0;
-}
-
-static int lua_call_on_should_infer(int idx, int peak) {
-    lua_getglobal(g_L, "on_should_infer");
-    if (!lua_isfunction(g_L, -1)) { lua_pop(g_L, 1); return 0; }
-    lua_pushinteger(g_L, idx);
-    lua_pushinteger(g_L, peak);
-    if (lua_pcall(g_L, 2, 1, 0) != LUA_OK) {
-        fprintf(stderr, "[lua] on_should_infer: %s\n", lua_tostring(g_L, -1));
-        lua_pop(g_L, 1);
-        return 0;
-    }
-    int ret = lua_toboolean(g_L, -1);
-    lua_pop(g_L, 1);
-    return ret;
-}
-
-static std::string lua_call_on_ai_format(const std::string &text) {
-    lua_getglobal(g_L, "on_ai_format");
-    if (!lua_isfunction(g_L, -1)) { lua_pop(g_L, 1); return text; }
-    lua_pushstring(g_L, text.c_str());
-    if (lua_pcall(g_L, 1, 1, 0) != LUA_OK) {
-        fprintf(stderr, "[lua] on_ai_format: %s\n", lua_tostring(g_L, -1));
-        lua_pop(g_L, 1);
-        return text;
-    }
-    std::string ret = lua_tostring(g_L, -1) ?: text;
-    lua_pop(g_L, 1);
-    return ret;
 }
 
 // ─── AI 工作线程 ───────────────────────────────────────────────
 static void ai_worker() {
     // 设置音频增益
-    SYS("amixer -c 1 sset 'Front Mic Boost' 3 2>/dev/null");
-    SYS("amixer -c 1 sset 'Capture' 46 2>/dev/null");
+    SYS("amixer -c 2 sset 'Mic Capture Volume' 7810 2>/dev/null");
+    SYS("amixer -c 2 sset 'Mic Capture Switch' on 2>/dev/null");
 
     // 模型初始化
     {
@@ -321,29 +162,16 @@ static void ai_worker() {
     }
     g_ctx->async = true;
     g_ctx->force_listen_count = 0;
-    g_ctx->listen_prob_scale = -100.0;
-    g_ctx->audio_voice_clone_prompt = "<|im_start|>system\nStreaming Omni Conversation.\n<|audio_start|>";
+    g_ctx->audio_voice_clone_prompt = "<|im_start|>system\n你必须仔细听用户的语音输入并根据内容用中文回应。忽略画面内容，专注于语音。\n<|audio_start|>";
     g_ctx->audio_assistant_prompt   = "<|audio_end|><|im_end|>\n";
-    g_ctx->omni_voice_clone_prompt  = "<|im_start|>system\nStreaming Omni Conversation.\n<|audio_start|>";
+    g_ctx->omni_voice_clone_prompt  = "<|im_start|>system\n你必须仔细听用户的语音输入并根据内容用中文回应。忽略画面内容，专注于语音。\n<|audio_start|>";
     g_ctx->omni_assistant_prompt    = "<|audio_end|><|im_end|>\n";
     printf("[模型] 就绪\n");
 
-    // 系统 prompt 初始化 (用短静音代替参考音频)
-    printf("[模型] 系统 prompt 初始化\n");
-    {
-        // 写一个短的静音 WAV (0.1s) 用于初始化
-        auto le32 = [](int v) { return std::string{char(v), char(v>>8), char(v>>16), char(v>>24)}; };
-        auto le16 = [](int v) { return std::string{char(v), char(v>>8)}; };
-        int dsz = 3200;  // 0.1s at 16kHz, 16-bit
-        std::string h = "RIFF" + le32(36+dsz) + "WAVE"
-                      + "fmt " + le32(16) + le16(1) + le16(1)
-                      + le32(16000) + le32(32000) + le16(2) + le16(16)
-                      + "data" + le32(dsz) + std::string(dsz, '\0');
-        FILE *fp = fopen("/tmp/_silence.wav", "wb");
-        if (fp) { fwrite(h.data(), 1, h.size(), fp); fclose(fp); }
-        stream_prefill(g_ctx, "/tmp/_silence.wav", "", 0);
-        remove("/tmp/_silence.wav");
-    }
+    // 声纹克隆
+    std::string ref_audio = "/opt/friday/chat/MiniCPM-o-Demo/assets/ref_audio/ref_minicpm_signature.wav";
+    stream_prefill(g_ctx, ref_audio, "", 0);
+    printf("[模型] 声纹设置完成\n");
 
     // 摄像头初始化
     cv::VideoCapture cap(0);
@@ -370,6 +198,11 @@ static void ai_worker() {
     }
     printf("[摄像头] 就绪 %dx%d\n", first.cols, first.rows);
 
+    // 滴滴两声启动提示
+    SYS("ffmpeg -y -f lavfi -i 'sine=frequency=880:duration=0.12' -ac 1 -ar 22050 /tmp/_beep.wav 2>/dev/null");
+    SYS("aplay -D plughw:0,3 /tmp/_beep.wav -q 2>/dev/null");
+    SYS("usleep 150000; aplay -D plughw:0,3 /tmp/_beep.wav -q 2>/dev/null &");
+
     // 摄像头采集线程
     std::thread cam_th([&cap]() {
         while (g_run) {
@@ -383,43 +216,85 @@ static void ai_worker() {
         }
     });
 
-    // 加载 Lua 业务脚本
-    if (!lua_init_engine()) {
-        fprintf(stderr, "[错误] Lua 引擎初始化失败\n");
-        return;
-    }
-    time_t lua_mtime = 0;
-    const char *lua_path = "/opt/friday/chat/custom_server/scripts/friday.lua";
-
-    // 主循环: 由 Lua on_tick 驱动全部业务逻辑
+    // 主推理循环
     int idx = 0;
+    time_t last_infer_time = 0;
     while (g_run) {
-        // 热更新检测
-        struct stat st;
-        if (stat(lua_path, &st) == 0 && st.st_mtime != lua_mtime) {
-            lua_mtime = st.st_mtime;
-            lua_close(g_L); g_L = nullptr;
-            if (!lua_init_engine()) {
-                fprintf(stderr, "[lua] 热更新失败\n");
-            } else {
-                printf("[lua] 热更新完成\n");
-            }
-        }
         wake_check();
         idx++;
+        char img[64], wav[64];
+        snprintf(img, sizeof(img), "/tmp/f_%d.jpg", idx);
+        snprintf(wav, sizeof(wav), "/tmp/m_%d.wav", idx);
 
-        // 调用 Lua on_tick(idx)，内部调用 C 接口完成全部操作
-        lua_getglobal(g_L, "on_tick");
-        if (lua_isfunction(g_L, -1)) {
-            lua_pushinteger(g_L, idx);
-            if (lua_pcall(g_L, 1, 0, 0) != LUA_OK) {
-                fprintf(stderr, "[lua] on_tick: %s\n", lua_tostring(g_L, -1));
-                lua_pop(g_L, 1);
-            }
-        } else {
-            lua_pop(g_L, 1);
-            usleep(200000);
+        // 保存帧
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            if (!g_frame.empty()) cv::imwrite(img, g_frame);
         }
+
+        // 录音
+        record_mic(wav);
+
+        // 检测音量峰值
+        int peak = 0;
+        {
+            FILE *f = fopen(wav, "rb");
+            if (f) {
+                fseek(f, 44, SEEK_SET);
+                for (int i = 0; i < 16000; i++) { short s; if (fread(&s, 2, 1, f) != 1) break; int a = abs(s); if (a > peak) peak = a; }
+                fclose(f);
+            }
+        }
+        printf("[mic] peak=%d%s\n", peak, peak > 3000 ? " 人声" : "");
+
+        // 冷却+音量检测，防止自激
+        time_t now = time(nullptr);
+        if ((peak < 200 || now - last_infer_time < 5) && idx > 5) {
+            play_tts();
+            std::lock_guard<std::mutex> lk(g_mtx);
+            g_status = "等待语音输入...";
+            remove(img); remove(wav);
+            continue;
+        }
+
+        last_infer_time = now;
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            g_status = "推理中...";
+        }
+
+        // AI 推理
+        stream_prefill(g_ctx, wav, img, idx, 1);
+        stream_decode(g_ctx, "/tmp/omni_out2", idx);
+        clean_kvcache(g_ctx);
+
+        // 读取 AI 文字回复
+        {
+            std::lock_guard<std::mutex> lk(g_ctx->text_mtx);
+            while (!g_ctx->text_queue.empty()) {
+                auto txt = g_ctx->text_queue.front();
+                g_ctx->text_queue.pop_front();
+                if (!txt.empty() && txt != "__IS_LISTEN__" && txt != "__END_OF_TURN__") {
+                    printf("[AI] %s\n", txt.c_str());
+                    std::lock_guard<std::mutex> lk2(g_mtx);
+                    g_ai_texts.push_back(txt);
+                    if (g_ai_texts.size() > 5) g_ai_texts.pop_front();
+                }
+            }
+        }
+
+        // 播放 TTS
+        play_tts();
+
+        // 恢复状态
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            g_status = "运行中";
+        }
+
+        remove(img);
+        remove(wav);
+        usleep(200000);
     }
 
     // 清理
