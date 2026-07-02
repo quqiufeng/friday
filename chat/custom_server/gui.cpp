@@ -89,15 +89,18 @@ static bool record_mic(const char *wav_path) {
 }
 
 // ─── 合并并播放 TTS ─────────────────────────────────────────────
-static void play_tts_merge() {
+// ─── 播放新生成的 TTS WAV ─────────────────────────────────────
+static void play_tts() {
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
-        "D=$(find /tmp/omni_out2 -name generation_done.flag -type f 2>/dev/null "
-        "| head -1 | xargs -r dirname) && [ -n \"$D\" ] && "
-        "[ ! -f \"$D/.played\" ] && "
-        "W=$(ls -v \"$D\"/wav_*.wav 2>/dev/null | tr '\\n' '|') && "
-        "ffmpeg -y -i \"concat:${W%%|}\" -c copy \"$D/merged.wav\" 2>/dev/null && "
-        "aplay -D %s -q \"$D/merged.wav\" 2>/dev/null && touch \"$D/.played\"",
+        "LAST=$(cat /tmp/tts_last 2>/dev/null || echo -1); "
+        "find /tmp/omni_out2 -name 'wav_*.wav' -type f 2>/dev/null "
+        "| sort -t_ -k2 -n | while read F; do "
+        "N=$(echo \"$F\" | sed 's/.*wav_//;s/\\.wav//'); "
+        "[ \"$N\" -gt \"$LAST\" ] 2>/dev/null || continue; "
+        "aplay -D %s -q \"$F\" </dev/null >/dev/null 2>&1; "
+        "echo \"$N\" > /tmp/tts_last; "
+        "done",
         TTS_DEVICE);
     SYS(cmd);
 }
@@ -138,17 +141,29 @@ static void ai_worker() {
     }
     g_ctx->async = true;
     g_ctx->force_listen_count = 0;
-    g_ctx->listen_prob_scale = 0.0;
-    g_ctx->audio_voice_clone_prompt = "<|im_start|>system\n每次收到画面都必须用中文说话。描述画面内容。不要沉默。\n<|audio_start|>";
+    g_ctx->listen_prob_scale = -100.0;
+    g_ctx->audio_voice_clone_prompt = "<|im_start|>system\nStreaming Omni Conversation.\n<|audio_start|>";
     g_ctx->audio_assistant_prompt   = "<|audio_end|><|im_end|>\n";
-    g_ctx->omni_voice_clone_prompt  = "<|im_start|>system\n每次收到画面都必须用中文说话。描述画面内容。不要沉默。\n<|audio_start|>";
+    g_ctx->omni_voice_clone_prompt  = "<|im_start|>system\nStreaming Omni Conversation.\n<|audio_start|>";
     g_ctx->omni_assistant_prompt    = "<|audio_end|><|im_end|>\n";
     printf("[模型] 就绪\n");
 
-    // 声纹克隆
-    std::string ref_audio = "/opt/friday/chat/MiniCPM-o-Demo/assets/ref_audio/ref_minicpm_signature.wav";
-    stream_prefill(g_ctx, ref_audio, "", 0);
-    printf("[模型] 声纹设置完成\n");
+    // 系统 prompt 初始化 (用短静音代替参考音频)
+    printf("[模型] 系统 prompt 初始化\n");
+    {
+        // 写一个短的静音 WAV (0.1s) 用于初始化
+        auto le32 = [](int v) { return std::string{char(v), char(v>>8), char(v>>16), char(v>>24)}; };
+        auto le16 = [](int v) { return std::string{char(v), char(v>>8)}; };
+        int dsz = 3200;  // 0.1s at 16kHz, 16-bit
+        std::string h = "RIFF" + le32(36+dsz) + "WAVE"
+                      + "fmt " + le32(16) + le16(1) + le16(1)
+                      + le32(16000) + le32(32000) + le16(2) + le16(16)
+                      + "data" + le32(dsz) + std::string(dsz, '\0');
+        FILE *fp = fopen("/tmp/_silence.wav", "wb");
+        if (fp) { fwrite(h.data(), 1, h.size(), fp); fclose(fp); }
+        stream_prefill(g_ctx, "/tmp/_silence.wav", "", 0);
+        remove("/tmp/_silence.wav");
+    }
 
     // 摄像头初始化
     cv::VideoCapture cap(0);
@@ -188,8 +203,9 @@ static void ai_worker() {
         }
     });
 
-    // 主推理循环
+    // 主推理循环 (每 10 秒推理一次)
     int idx = 0;
+    time_t last_speak = 0;
     while (g_run) {
         wake_check();
         idx++;
@@ -211,13 +227,22 @@ static void ai_worker() {
         // 录音
         record_mic(wav);
 
-        // 更新状态
+        // 冷却
+        time_t now = time(nullptr);
+        if (now - last_speak < 10) {
+            play_tts();
+            std::lock_guard<std::mutex> lk(g_mtx);
+            g_status = "运行中";
+            remove(img); remove(wav);
+            continue;
+        }
+        last_speak = now;
+
         {
             std::lock_guard<std::mutex> lk(g_mtx);
             g_status = "推理中...";
         }
 
-        // AI 推理
         stream_prefill(g_ctx, wav, img, idx, 1);
         stream_decode(g_ctx, "/tmp/omni_out2", idx);
 
@@ -240,7 +265,7 @@ static void ai_worker() {
         }
 
         // 播放 TTS
-        play_tts_merge();
+        play_tts();
 
         // 恢复状态
         {
