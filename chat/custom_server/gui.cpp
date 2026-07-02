@@ -138,6 +138,7 @@ static void ai_worker() {
     // 设置音频增益
     SYS("amixer -c 2 sset 'Mic Capture Volume' 7810 2>/dev/null");
     SYS("amixer -c 2 sset 'Mic Capture Switch' on 2>/dev/null");
+    SYS("amixer -c 1 sset 'Auto-Mute Mode' Disabled 2>/dev/null");
 
     // 模型初始化
     {
